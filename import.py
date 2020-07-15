@@ -194,9 +194,9 @@ class FireflyData:
     """
 
     currencies: Dict[str, int] = dataclasses.field(default_factory=dict)
-    asset_accounts: Dict[str, int] = dataclasses.field(default_factory=dict)
-    revenue_accounts: Dict[str, int] = dataclasses.field(default_factory=dict)
-    expense_accounts: Dict[str, int] = dataclasses.field(default_factory=dict)
+    asset_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
+    revenue_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
+    expense_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
 
 
 def create_transaction():
@@ -249,7 +249,7 @@ class Session(requests.Session):
             kwargs["data"] = json.dumps(kwargs.pop("json"), default=self._json_default)
         response = super().request(method, url, **kwargs)
         if not response.ok:
-            if method == "post" or response.status_code == 500:
+            if method in ["PUT", "POST"] or response.status_code == 500:
                 print(response.json())
             response.raise_for_status()
         return response
@@ -310,9 +310,7 @@ class Importer:
 
         if not dry_run:
             self._create_currencies()
-            self._create_asset_accounts()
-            self._create_revenue_accounts()
-            self._create_expense_accounts()
+            self._create_accounts()
             self._create_transactions()
 
     def _acc_config(self, acc: str) -> Config.Account:
@@ -325,7 +323,7 @@ class Importer:
         return arrow.get(dt, self.config.date_format)
 
     def _payee(self, tx: YNABTransaction) -> str:
-        return self.config.payee_mapping.get(tx.payee, tx.payee)
+        return self.config.payee_mapping.get(tx.payee.strip(), tx.payee.strip())
 
     def _amount(self, tx: YNABTransaction) -> Decimal:
         # exactly one of these would be non-zero
@@ -608,14 +606,23 @@ class Importer:
             elif data["attributes"]["enabled"]:
                 self._session.post(f"{self.firefly_url}/api/v1/currencies/{code}/disable")
 
-    def _create_asset_accounts(self) -> None:
+    def _create_accounts(self) -> None:
         response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/accounts")
 
-        existing_account_data = {}
         for data in response["data"]:
-            self.firefly_data.asset_accounts[data["attributes"]["name"]] = data["id"]
-            existing_account_data[data["attributes"]["name"]] = data
+            if data["attributes"]["type"] == "asset":
+                self.firefly_data.asset_accounts[data["attributes"]["name"]] = data
+            elif data["attributes"]["type"] == "expense":
+                self.firefly_data.expense_accounts[data["attributes"]["name"]] = data
+            elif data["attributes"]["type"] == "revenue":
+                self.firefly_data.revenue_accounts[data["attributes"]["name"]] = data
+            elif data["attributes"]["type"] not in ["initial-balance"]:
+                raise ValueError(f"Found account of unknown type: {data['attributes']['type']}")
 
+        self._create_asset_accounts()
+        self._create_revenue_and_accounts()
+
+    def _create_asset_accounts(self) -> None:
         for account in self.data.asset_accounts:
             data = {
                 "name": account.name,
@@ -637,24 +644,46 @@ class Importer:
             if account.name in self.firefly_data.asset_accounts:
                 needs_update = False
                 for k, v in data.items():
-                    if not _firefly_compare(v, existing_account_data[account.name]["attributes"].get(k)):
-                        print(account.name, k, existing_account_data[account.name]["attributes"].get(k), v)
+                    if not _firefly_compare(v, self.firefly_data.asset_accounts[account.name]["attributes"].get(k)):
                         needs_update = True
                         break
                 if needs_update:
                     self._session.put(
-                        f"{self.firefly_url}/api/v1/accounts/{existing_account_data[account.name]['id']}", json=data,
+                        f"{self.firefly_url}/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}",
+                        json=data,
                     )
             else:
                 response = self._session.post(f"{self.firefly_url}/api/v1/accounts", json=data)
                 self.firefly_data.asset_accounts[account.name] = response.json()["data"]["id"]
         print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
 
-    def _create_revenue_accounts(self) -> None:
-        pass
+    def _create_revenue_and_accounts(self) -> None:
+        for (account_type, accounts, firefly_data) in [
+            ("revenue", self.data.revenue_accounts, self.firefly_data.revenue_accounts),
+            ("expense", self.data.expense_accounts, self.firefly_data.expense_accounts),
+        ]:
+            for account in accounts:
+                data = {
+                    "name": account,
+                    "active": True,
+                    "type": account_type,
+                    "include_net_worth": True,
+                }
 
-    def _create_expense_accounts(self) -> None:
-        pass
+                if account in firefly_data:
+                    needs_update = False
+                    for k, v in data.items():
+                        if not _firefly_compare(v, firefly_data[account]["attributes"].get(k)):
+                            needs_update = True
+                            break
+                    if needs_update:
+                        self._session.put(
+                            f"{self.firefly_url}/api/v1/accounts/{firefly_data[account]['id']}", json=data,
+                        )
+                else:
+                    response = self._session.post(f"{self.firefly_url}/api/v1/accounts", json=data)
+                    firefly_data[account] = response.json()["data"]["id"]
+            print(f"Created {len(firefly_data)} {account_type} accounts")
 
     def _create_transactions(self) -> None:
         pass
