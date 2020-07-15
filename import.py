@@ -4,10 +4,12 @@ import enum
 import os
 import re
 import sys
+from collections import defaultdict
 from decimal import Decimal
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import arrow
+import funcy
 import requests
 import toml
 
@@ -70,45 +72,48 @@ class ImportData:
         currency_code: str = "USD"
 
     @dataclasses.dataclass
-    class Withdrawal:
-        account: str
-        date: arrow.Arrow
-        payee: str
-        amount: Decimal
-        description: str
-        budget: str = ""
-        category: str = ""
-        notes: str = ""
+    class TransactionGroup:
+        @dataclasses.dataclass
+        class Withdrawal:
+            account: str
+            date: arrow.Arrow
+            payee: str
+            amount: Decimal
+            description: str
+            budget: str = ""
+            category: str = ""
+            notes: str = ""
 
-    @dataclasses.dataclass
-    class Deposit:
-        account: str
-        date: arrow.Arrow
-        payee: str
-        amount: Decimal
-        description: str
-        budget: str = ""
-        category: str = ""
-        notes: str = ""
+        @dataclasses.dataclass
+        class Deposit:
+            account: str
+            date: arrow.Arrow
+            payee: str
+            amount: Decimal
+            description: str
+            budget: str = ""
+            category: str = ""
+            notes: str = ""
 
-    @dataclasses.dataclass
-    class Transfer:
-        from_account: str
-        to_account: str
-        date: arrow.Arrow
-        amount: Decimal
-        description: str
-        # set if exactly one of: from, to is foreign currency account
-        foreign_amount: Decimal = None
-        notes: str = ""
+        @dataclasses.dataclass
+        class Transfer:
+            from_account: str
+            to_account: str
+            date: arrow.Arrow
+            amount: Decimal
+            description: str
+            # set if exactly one of: from, to is foreign currency account
+            foreign_amount: Decimal = None
+            notes: str = ""
+
+        title: str = ""
+        transactions: List[Union[Withdrawal, Deposit, Transfer]] = dataclasses.field(default_factory=list)
 
     asset_accounts: List[Account] = dataclasses.field(default_factory=list)
     revenue_accounts: List[str] = dataclasses.field(default_factory=list)
     expense_accounts: List[str] = dataclasses.field(default_factory=list)
 
-    withdrawals: List[Withdrawal] = dataclasses.field(default_factory=list)
-    deposits: List[Deposit] = dataclasses.field(default_factory=list)
-    transfers: List[Transfer] = dataclasses.field(default_factory=list)
+    transaction_groups: List[TransactionGroup] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -159,7 +164,12 @@ class Importer:
     def _payee(self, tx: Dict) -> str:
         return self.config.payee_mapping.get(tx["Payee"], tx["Payee"])
 
-    def _foreign_amount_from_memo(self, tx: Dict) -> Decimal:
+    def _amount(self, tx: Dict) -> Decimal:
+        # exactly one of these would be non-zero
+        amount = _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
+        if tx["Account"] not in self.config.foreign_accounts:
+            return amount
+
         # for foreign accounts, try to use memo to find real value at the time of transaction
         m = self.MEMO_RE.match(tx["Memo"])
         foreign_currency_code = self.config.foreign_accounts[tx["Account"]]
@@ -174,14 +184,6 @@ class Importer:
                 f"[AMOUNT]. Alternatively, set config.currency_conv_fallback."
             )
         return amount * conv_fallback
-
-    def _amount(self, tx: Dict) -> Decimal:
-        # exactly one of these would be non-zero
-        amount = _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
-        if tx["Account"] not in self.config.foreign_accounts:
-            return amount
-
-        return self._foreign_amount_from_memo(tx)
 
     def _category(self, tx: Dict) -> str:
         return tx[self.config.category_field]
@@ -215,8 +217,23 @@ class Importer:
             return _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
         # From default currency account to foreign account
         elif tx["Account"] not in self.config.foreign_accounts and to_account in self.config.foreign_accounts:
+            # for foreign accounts, try to use memo to find real value at the time of transaction
+            m = self.MEMO_RE.match(tx["Memo"])
+            foreign_currency_code = self.config.foreign_accounts[to_account]
+            if m and m.group(1) != self.config.foreign_accounts[to_account]:
+                # use memo - yaay!
+                return Decimal(m.group(2)) * (-1 if _to_amount(tx["Inflow"]) > 0 else 1)
+
+            conv_fallback = self.config.currency_conv_fallback.get(foreign_currency_code)
+            if not conv_fallback:
+                raise ValueError(
+                    f"Unable to determine foreign amount for {tx}. Memo must be of form: [CURRENCY CODE] "
+                    f"[AMOUNT]. Alternatively, set config.currency_conv_fallback."
+                )
             # Amount is default currency
-            return self._foreign_amount_from_memo(tx)
+            amount = _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
+            return amount * conv_fallback
+
         elif tx["Account"] in self.config.foreign_accounts and to_account in self.config.foreign_accounts:
             assert (
                 self.config.foreign_accounts[tx["Account"]] == self.config.foreign_accounts[to_account]
@@ -229,6 +246,7 @@ class Importer:
             next(reader)
             all_transactions = list(reader)
         print(f"Loaded {len(all_transactions)} transactions")
+        all_transactions = sorted(all_transactions, key=self._date, reverse=True)
 
         account_names = {tx["Account"] for tx in all_transactions}
         for acc in self.config.foreign_accounts:
@@ -262,42 +280,81 @@ class Importer:
             f"expense accounts"
         )
 
-        for tx in all_transactions:
-            if _to_amount(tx["Outflow"]) > 0:
-                withdrawal = ImportData.Withdrawal(
-                    account=tx["Account"],
-                    date=self._date(tx),
-                    payee=self._payee(tx),
-                    amount=self._amount(tx),
-                    description=self._description(tx),
-                    budget=self._budget(tx),
-                    category=self._category(tx),
-                    notes=self._notes(tx),
-                )
-                self.data.withdrawals.append(withdrawal)
-            elif _to_amount(tx["Inflow"]) > 0:
-                deposit = ImportData.Deposit(
-                    account=tx["Account"],
-                    date=self._date(tx),
-                    payee=self._payee(tx),
-                    amount=self._amount(tx),
-                    description=self._description(tx),
-                    budget=self._budget(tx),
-                    category=self._category(tx),
-                    notes=self._notes(tx),
-                )
-                self.data.deposits.append(deposit)
-            elif _is_transfer(tx):
-                transfer = ImportData.Transfer(
-                    from_account=tx["Account"],
-                    to_account=self._transfer_account(tx),
-                    date=self._date(tx),
-                    amount=self._amount(tx),
-                    description=self._description(tx),
-                    foreign_amount=self._transfer_foreign_amount(tx),
-                    notes=self._notes(tx),
-                )
-        print(f"Configured {len(self.data.deposits)} deposits and {len(self.data.withdrawals)} withdrawals")
+        splits, non_splits = funcy.lsplit(lambda tx: "(Split " in tx["Memo"], all_transactions)
+        splits_grouped = defaultdict(list)
+        for tx in splits:
+            splits_grouped[(tx["Account"], tx["Date"], tx["Running Balance"])].append(tx)
+        # process splits first because in case of transfers, we want to split version of Transfer rather than the other
+        all_tx_grouped = list(splits_grouped.values())
+        all_tx_grouped.extend([[tx] for tx in non_splits])
+
+        # used to de-dup transactions because YNAB will double-log every transfer
+        # map key: tuple of accounts (sorted by name), date, abs(outflow - inflow)
+        # map value: int - how many times this was seen. Max = 2
+        transfers_seen_map: Dict[Tuple[Tuple[str], arrow.Arrow, Decimal]] = {}
+
+        withdrawals_count = deposits_count = transfers_count = 0
+        for tx_group in all_tx_grouped:
+            transaction_group = ImportData.TransactionGroup()
+            if len(tx_group) > 0:
+                transaction_group.title = self.config.empty_description
+
+            for tx in tx_group:
+                if _to_amount(tx["Outflow"]) > 0:
+                    withdrawal = ImportData.TransactionGroup.Withdrawal(
+                        account=tx["Account"],
+                        date=self._date(tx),
+                        payee=self._payee(tx),
+                        amount=self._amount(tx),
+                        description=self._description(tx),
+                        budget=self._budget(tx),
+                        category=self._category(tx),
+                        notes=self._notes(tx),
+                    )
+                    transaction_group.transactions.append(withdrawal)
+                    withdrawals_count += 1
+                elif _to_amount(tx["Inflow"]) > 0:
+                    deposit = ImportData.TransactionGroup.Deposit(
+                        account=tx["Account"],
+                        date=self._date(tx),
+                        payee=self._payee(tx),
+                        amount=self._amount(tx),
+                        description=self._description(tx),
+                        budget=self._budget(tx),
+                        category=self._category(tx),
+                        notes=self._notes(tx),
+                    )
+                    transaction_group.transactions.append(deposit)
+                    deposits_count += 1
+                elif _is_transfer(tx):
+                    transfer_account = self._transfer_account(tx)
+                    amount = self._amount(tx)
+                    date = self._date(tx)
+                    transfer_seen_map_key = (
+                        tuple(sorted([tx["Account"], transfer_account])),
+                        date,
+                        abs(amount),
+                    )
+                    if transfers_seen_map.get(transfer_seen_map_key, 0) % 2 == 1:
+                        transfers_seen_map[transfer_seen_map_key] += 1
+                        continue
+                    transfers_seen_map[transfer_seen_map_key] = 1
+                    transfer = ImportData.TransactionGroup.Transfer(
+                        from_account=tx["Account"],
+                        to_account=transfer_account,
+                        date=date,
+                        amount=amount,
+                        description=self._description(tx),
+                        foreign_amount=self._transfer_foreign_amount(tx),
+                        notes=self._notes(tx),
+                    )
+                    transaction_group.transactions.append(transfer)
+                    transfers_count += 1
+            self.data.transaction_groups.append(transaction_group)
+        print(
+            f"Configured transaction data for {deposits_count} deposits and {withdrawals_count} withdrawals, and "
+            f"{transfers_count} transfers in a total of {len(self.data.transaction_groups)} groups."
+        )
 
         self._create_asset_accounts()
         self._create_revenue_accounts()
