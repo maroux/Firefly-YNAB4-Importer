@@ -45,18 +45,51 @@ YNAB_FIELDS = [
 
 
 @dataclasses.dataclass
+class YNABTransaction:
+    """
+    Source data from YNAB register (refer to YNAB_FIELDS for docs)
+    """
+
+    account: str
+    flag: str
+    date: arrow.Arrow
+    payee: str
+    category: str
+    master_category: str
+    sub_category: str
+    memo: str
+    outflow: Decimal
+    inflow: Decimal
+    cleared: bool
+    running_balance: Decimal
+
+
+@dataclasses.dataclass
 class Config:
+    """
+    Application configuration
+    """
+
     @dataclasses.dataclass
     class Account:
+        class Role(enum.Enum):
+            credit_card = "credit_card"
+            default = "default"
+            savings = "savings"
+            cash = "cash"
+
         # Mapping of Account Name to foreign currency code (ISO 4217)
         # will use default currency if not specified
         currency: str = ""
 
         # Account roles (credit_card / cash / savings)
-        role: str = "default"
+        role: Role = Role.default
 
         # Monthly bill payment date (if not specified will be inferred from transfer transactions)
         monthly_payment_date: str = ""
+
+        # Mark account as inactive after import
+        inactive: bool = False
 
     # All of your YNAB accounts - only need to add here if there's some customization to be done.
     accounts: Dict[str, Account] = dataclasses.field(default_factory=dict)
@@ -94,6 +127,10 @@ class Config:
 
 @dataclasses.dataclass
 class ImportData:
+    """
+    Processed data to be imported into Firefly
+    """
+
     @dataclasses.dataclass
     class Account:
         class Role(enum.Enum):
@@ -152,6 +189,10 @@ class ImportData:
 
 @dataclasses.dataclass
 class FireflyData:
+    """
+    Data in firefly - mostly primary keys (ids) for various objects
+    """
+
     currencies: Dict[str, int] = dataclasses.field(default_factory=dict)
     asset_accounts: Dict[str, int] = dataclasses.field(default_factory=dict)
     revenue_accounts: Dict[str, int] = dataclasses.field(default_factory=dict)
@@ -171,13 +212,27 @@ def _to_amount(s: str) -> Decimal:
     return Decimal(m.group(1).replace(",", ""))
 
 
-def _is_transfer(tx: Dict) -> bool:
-    return "Transfer : " in tx["Payee"]
+def _ynab_field_name(s: str) -> str:
+    return s.lower().replace(" ", "_")
+
+
+def _is_transfer(tx: YNABTransaction) -> bool:
+    return "Transfer : " in tx.payee
+
+
+def _firefly_compare(obj, firefly_obj) -> bool:
+    if isinstance(obj, arrow.Arrow):
+        return obj.format("YYYY-MM-DD") == firefly_obj
+    elif isinstance(obj, Decimal) and firefly_obj is not None:
+        return obj == Decimal(str(firefly_obj))
+    elif firefly_obj is None:
+        return obj == 0
+    return obj == firefly_obj
 
 
 class Session(requests.Session):
     @staticmethod
-    def _decimal_json_default(obj):
+    def _json_default(obj):
         if isinstance(obj, Decimal):
             int_val = int(obj)
             if int_val == obj:
@@ -191,7 +246,7 @@ class Session(requests.Session):
 
     def request(self, method, url, **kwargs) -> requests.Response:
         if "json" in kwargs:
-            kwargs["data"] = json.dumps(kwargs.pop("json"), default=self._decimal_json_default)
+            kwargs["data"] = json.dumps(kwargs.pop("json"), default=self._json_default)
         response = super().request(method, url, **kwargs)
         if not response.ok:
             if method == "post" or response.status_code == 500:
@@ -229,7 +284,7 @@ class Importer:
         self.firefly_token = os.environ["FIREFLY_III_ACCESS_TOKEN"]
 
         self.config = dacite.from_dict(
-            Config, toml.load(config_path), config=dacite.Config(type_hooks={Decimal: Decimal})
+            Config, toml.load(config_path), config=dacite.Config(cast=[Decimal, Config.Account.Role], strict=True)
         )
         print(f"Loaded config for import into {self.firefly_url}")
 
@@ -238,7 +293,7 @@ class Importer:
         self.data = ImportData()
         self.firefly_data = FireflyData()
 
-        self.all_transactions: List[Dict] = None
+        self.all_transactions: List[YNABTransaction] = None
 
         self._import_tag = f"import-{arrow.now().format('YYYY-MM-DDTHH-MM')}"
 
@@ -260,30 +315,30 @@ class Importer:
             self._create_expense_accounts()
             self._create_transactions()
 
+    def _acc_config(self, acc: str) -> Config.Account:
+        return self.config.accounts.get(acc, Config.Account())
+
     def _is_foreign(self, acc: str) -> bool:
-        return self.config.accounts.get(acc, Config.Account()).currency != self.config.currency
+        return self._acc_config(acc).currency and self._acc_config(acc).currency != self.config.currency
 
     def _parse_date(self, dt: str) -> arrow.Arrow:
         return arrow.get(dt, self.config.date_format)
 
-    def _date(self, tx: Dict) -> arrow.Arrow:
-        return self._parse_date(tx["Date"])
+    def _payee(self, tx: YNABTransaction) -> str:
+        return self.config.payee_mapping.get(tx.payee, tx.payee)
 
-    def _payee(self, tx: Dict) -> str:
-        return self.config.payee_mapping.get(tx["Payee"], tx["Payee"])
-
-    def _amount(self, tx: Dict) -> Decimal:
+    def _amount(self, tx: YNABTransaction) -> Decimal:
         # exactly one of these would be non-zero
-        amount = _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
-        if self._is_foreign(tx["Account"]):
+        amount = tx.outflow - tx.inflow
+        if not self._is_foreign(tx.account):
             return amount
 
         # for foreign accounts, try to use memo to find real value at the time of transaction
-        m = self.MEMO_RE.match(tx["Memo"])
-        foreign_currency_code = self.config.accounts[tx["Account"]].currency
-        if m and m.group(1) == self.config.accounts[tx["Account"]].currency:
+        m = self.MEMO_RE.match(tx.memo)
+        foreign_currency_code = self._acc_config(tx.account).currency
+        if m and m.group(1) == self._acc_config(tx.account).currency:
             # use memo - yaay!
-            return Decimal(m.group(2)) * (-1 if _to_amount(tx["Inflow"]) > 0 else 1)
+            return Decimal(m.group(2).replace(",", "")) * (-1 if tx.inflow > 0 else 1)
 
         conv_fallback = self.config.currency_conv_fallback.get(foreign_currency_code)
         if not conv_fallback:
@@ -293,52 +348,52 @@ class Importer:
             )
         return amount * conv_fallback
 
-    def _category(self, tx: Dict) -> str:
-        return tx[self.config.category_field]
+    def _category(self, tx: YNABTransaction) -> str:
+        return getattr(tx, _ynab_field_name(self.config.category_field))
 
-    def _budget(self, tx: Dict) -> str:
-        if tx["Master Category"] == "Hidden Categories":
+    def _budget(self, tx: YNABTransaction) -> str:
+        if tx.master_category == "Hidden Categories":
             return ""
-        return tx[self.config.budget_field]
+        return getattr(tx, _ynab_field_name(self.config.budget_field))
 
-    def _description(self, tx: Dict) -> str:
+    def _description(self, tx: YNABTransaction) -> str:
         if not self.config.memo_to_description:
             return self.config.empty_description
-        if "(Split" in tx["Memo"]:
-            return tx["Memo"].split(") ")[1].strip() or self.config.empty_description
-        return tx["Memo"].strip() or self.config.empty_description
+        if "(Split" in tx.memo:
+            return tx.memo.split(") ")[1].strip() or self.config.empty_description
+        return tx.memo.strip() or self.config.empty_description
 
-    def _notes(self, tx: Dict) -> str:
+    def _notes(self, tx: YNABTransaction) -> str:
         if not self.config.memo_to_description:
-            return tx["Memo"].strip()
+            return tx.memo.strip()
         return ""
 
-    def _tags(self, tx: Dict) -> List[str]:
+    def _tags(self, tx: YNABTransaction) -> List[str]:
         tags = [self._import_tag]
-        if tx["Flag"]:
-            tags.append(tx["Flag"])
+        if tx.flag:
+            tags.append(tx.flag)
         return tags
 
-    def _transfer_account(self, tx: Dict) -> str:
-        if " / Transfer : " in tx["Payee"]:
-            return tx["Payee"].split(" / ")[1].split(" : ")[1]
-        return tx["Payee"].split(" : ")[1]
+    def _transfer_account(self, tx: YNABTransaction) -> str:
+        if " / Transfer : " in tx.payee:
+            return tx.payee.split(" / ")[1].split(" : ")[1]
+        return tx.payee.split(" : ")[1]
 
-    def _transfer_foreign_amount(self, tx: Dict) -> Decimal:
+    def _transfer_foreign_amount(self, tx: YNABTransaction) -> Decimal:
         to_account = self._transfer_account(tx)
         # From foreign account to default currency account --
-        if self._is_foreign(tx["Account"]) and not self._is_foreign(to_account):
+        if self._is_foreign(tx.account) and not self._is_foreign(to_account):
             # Amount is already computed in `self._amount` above using foreign currency code
             # Outflow / Inflow corresponds to default currency
-            return _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
+            return tx.outflow - tx.inflow
         # From default currency account to foreign account
-        elif not self._is_foreign(tx["Account"]) and self._is_foreign(to_account):
+        elif not self._is_foreign(tx.account) and self._is_foreign(to_account):
             # for foreign accounts, try to use memo to find real value at the time of transaction
-            m = self.MEMO_RE.match(tx["Memo"])
-            foreign_currency_code = self.config.accounts[to_account].currency
-            if m and m.group(1) == self.config.accounts[to_account].currency:
+            m = self.MEMO_RE.match(tx.memo)
+            foreign_currency_code = self._acc_config(to_account).currency
+            if m and m.group(1) == self._acc_config(to_account).currency:
                 # use memo - yaay!
-                return Decimal(m.group(2)) * (-1 if _to_amount(tx["Inflow"]) > 0 else 1)
+                return Decimal(m.group(2).replace(",", "")) * (-1 if tx.inflow > 0 else 1)
 
             conv_fallback = self.config.currency_conv_fallback.get(foreign_currency_code)
             if not conv_fallback:
@@ -347,12 +402,12 @@ class Importer:
                     f"[AMOUNT]. Alternatively, set config.currency_conv_fallback."
                 )
             # Amount is default currency
-            amount = _to_amount(tx["Outflow"]) - _to_amount(tx["Inflow"])
+            amount = tx.outflow - tx.inflow
             return amount * conv_fallback
 
-        elif self._is_foreign(tx["Account"]) and self._is_foreign(to_account):
+        elif self._is_foreign(tx.account) and self._is_foreign(to_account):
             assert (
-                self.config.accounts[tx["Account"]].currency == self.config.accounts[to_account].currency
+                self._acc_config(tx.account).currency == self._acc_config(to_account).currency
             ), f"Can't handle transaction between two different foreign accounts: {tx}"
 
     def _read_register(self):
@@ -363,23 +418,45 @@ class Importer:
             next(reader)
             all_transactions = list(reader)
         print(f"Loaded {len(all_transactions)} transactions")
-        self.all_transactions = sorted(all_transactions, key=self._date, reverse=True)
+        self.all_transactions = [
+            YNABTransaction(
+                account=tx["Account"],
+                flag=tx["Flag"],
+                date=self._parse_date(tx["Date"]),
+                payee=tx["Payee"],
+                category=tx["Category"],
+                master_category=tx["Master Category"],
+                sub_category=tx["Sub Category"],
+                memo=tx["Memo"],
+                outflow=_to_amount(tx["Outflow"]),
+                inflow=_to_amount(tx["Inflow"]),
+                cleared=tx["Cleared"] == "R",
+                running_balance=_to_amount(tx["Running Balance"]),
+            )
+            for tx in all_transactions
+        ]
+        self.all_transactions = sorted(
+            # YNAB4 display sorts same date transactions by highest inflow first
+            self.all_transactions,
+            key=lambda tx: (tx.date, tx.inflow - tx.outflow),
+            reverse=True,
+        )
 
     def _process_accounts(self):
-        account_names = {tx["Account"] for tx in self.all_transactions}
+        account_names = {tx.account for tx in self.all_transactions}
         for acc in self.config.accounts:
             assert acc in account_names, f"Unknown account with no transactions in config: |{acc}|"
 
-        starting_balances: Dict[str, Tuple[str, Decimal]] = {
-            tx["Account"]: (tx["Date"], _to_amount(tx["Inflow"]) - _to_amount(tx["Outflow"]))
+        starting_balances: Dict[str, Tuple[arrow.Arrow, Decimal]] = {
+            tx.account: (tx.date, tx.inflow - tx.outflow)
             for tx in self.all_transactions
-            if tx["Payee"] == "Starting Balance"
+            if tx.payee == "Starting Balance"
         }
 
         for acc in account_names:
             start_date, balance = starting_balances[acc]
-            account_config = self.config.accounts.get(acc, Config.Account())
-            role = ImportData.Account.Role[account_config.role]
+            account_config = self._acc_config(acc)
+            role = ImportData.Account.Role[account_config.role.name]
             monthly_payment_date = None
             if role is ImportData.Account.Role.credit_card:
                 if account_config.monthly_payment_date:
@@ -395,7 +472,7 @@ class Importer:
                 else:
                     try:
                         monthly_payment_date = next(
-                            self._date(tx)
+                            tx.date
                             for tx in self.all_transactions
                             if _is_transfer(tx) and self._transfer_account(tx) == acc
                         )
@@ -404,7 +481,7 @@ class Importer:
                         monthly_payment_date = arrow.get("2020-01-01")  # year doesn't matter
             account = ImportData.Account(
                 name=acc,
-                opening_date=self._parse_date(start_date),
+                opening_date=start_date,
                 monthly_payment_date=monthly_payment_date,
                 role=role,
                 opening_balance=balance,
@@ -412,10 +489,10 @@ class Importer:
             self.data.asset_accounts.append(account)
 
         self.data.revenue_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if _to_amount(tx["Inflow"]) > 0 and not _is_transfer(tx)}
+            {self._payee(tx) for tx in self.all_transactions if tx.inflow > 0 and not _is_transfer(tx)}
         )
         self.data.expense_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if _to_amount(tx["Outflow"]) > 0 and not _is_transfer(tx)}
+            {self._payee(tx) for tx in self.all_transactions if tx.outflow > 0 and not _is_transfer(tx)}
         )
         print(
             f"Configured account data for {len(self.data.asset_accounts)} asset accounts, "
@@ -426,10 +503,10 @@ class Importer:
     def _process_transactions(self):
         print(f"Transactions will be tagged with {self._import_tag}")
 
-        splits, non_splits = funcy.lsplit(lambda tx: "(Split " in tx["Memo"], self.all_transactions)
+        splits, non_splits = funcy.lsplit(lambda tx: "(Split " in tx.memo, self.all_transactions)
         splits_grouped = defaultdict(list)
         for tx in splits:
-            splits_grouped[(tx["Account"], tx["Date"], tx["Running Balance"])].append(tx)
+            splits_grouped[(tx.account, tx.date, tx.running_balance)].append(tx)
         # process splits first because in case of transfers, we want to split version of Transfer rather than the other
         all_tx_grouped = list(splits_grouped.values())
         all_tx_grouped.extend([[tx] for tx in non_splits])
@@ -446,10 +523,34 @@ class Importer:
                 transaction_group.title = self.config.empty_description
 
             for tx in tx_group:
-                if _to_amount(tx["Outflow"]) > 0:
+                if _is_transfer(tx):
+                    transfer_account = self._transfer_account(tx)
+                    date = tx.date
+                    transfer_seen_map_key = (
+                        tuple(sorted([tx.account, transfer_account])),
+                        date,
+                        abs(tx.outflow - tx.inflow),
+                    )
+                    if transfers_seen_map.get(transfer_seen_map_key, 0) % 2 == 1:
+                        transfers_seen_map[transfer_seen_map_key] += 1
+                        continue
+                    transfers_seen_map[transfer_seen_map_key] = 1
+                    transfer = ImportData.TransactionGroup.Transfer(
+                        from_account=tx.account,
+                        to_account=transfer_account,
+                        date=date,
+                        amount=self._amount(tx),
+                        description=self._description(tx),
+                        foreign_amount=self._transfer_foreign_amount(tx),
+                        notes=self._notes(tx),
+                        tags=self._tags(tx),
+                    )
+                    transaction_group.transactions.append(transfer)
+                    transfers_count += 1
+                elif tx.outflow > 0:
                     withdrawal = ImportData.TransactionGroup.Withdrawal(
-                        account=tx["Account"],
-                        date=self._date(tx),
+                        account=tx.account,
+                        date=tx.date,
                         payee=self._payee(tx),
                         amount=self._amount(tx),
                         description=self._description(tx),
@@ -460,10 +561,10 @@ class Importer:
                     )
                     transaction_group.transactions.append(withdrawal)
                     withdrawals_count += 1
-                elif _to_amount(tx["Inflow"]) > 0:
+                elif tx.inflow > 0:
                     deposit = ImportData.TransactionGroup.Deposit(
-                        account=tx["Account"],
-                        date=self._date(tx),
+                        account=tx.account,
+                        date=tx.date,
                         payee=self._payee(tx),
                         amount=self._amount(tx),
                         description=self._description(tx),
@@ -474,31 +575,6 @@ class Importer:
                     )
                     transaction_group.transactions.append(deposit)
                     deposits_count += 1
-                elif _is_transfer(tx):
-                    transfer_account = self._transfer_account(tx)
-                    amount = self._amount(tx)
-                    date = self._date(tx)
-                    transfer_seen_map_key = (
-                        tuple(sorted([tx["Account"], transfer_account])),
-                        date,
-                        abs(amount),
-                    )
-                    if transfers_seen_map.get(transfer_seen_map_key, 0) % 2 == 1:
-                        transfers_seen_map[transfer_seen_map_key] += 1
-                        continue
-                    transfers_seen_map[transfer_seen_map_key] = 1
-                    transfer = ImportData.TransactionGroup.Transfer(
-                        from_account=tx["Account"],
-                        to_account=transfer_account,
-                        date=date,
-                        amount=amount,
-                        description=self._description(tx),
-                        foreign_amount=self._transfer_foreign_amount(tx),
-                        notes=self._notes(tx),
-                        tags=self._tags(tx),
-                    )
-                    transaction_group.transactions.append(transfer)
-                    transfers_count += 1
             self.data.transaction_groups.append(transaction_group)
         print(
             f"Configured transaction data for {deposits_count} deposits and {withdrawals_count} withdrawals, and "
@@ -515,7 +591,7 @@ class Importer:
 
     def _create_currencies(self) -> None:
         response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/currencies")
-        self.firefly_data.currencies = {d["attributes"]["code"]: d["id"] for d in response["data"]}
+        self.firefly_data.currencies = {d["attributes"]["code"]: int(d["id"]) for d in response["data"]}
         currencies = {d["attributes"]["code"]: d for d in response["data"]}
         currencies_to_keep = [
             "EUR",  # Firefly recommends keeping this always
@@ -534,6 +610,7 @@ class Importer:
 
     def _create_asset_accounts(self) -> None:
         response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/accounts")
+
         existing_account_data = {}
         for data in response["data"]:
             self.firefly_data.asset_accounts[data["attributes"]["name"]] = data["id"]
@@ -542,14 +619,17 @@ class Importer:
         for account in self.data.asset_accounts:
             data = {
                 "name": account.name,
+                "active": True,
                 "type": "asset",
-                "opening_balance": account.opening_balance,
-                "opening_balance_date": account.opening_date,
                 "account_role": account.role.value,
                 "currency_id": self.firefly_data.currencies[
                     self.config.accounts.get(account.name, Config.Account()).currency or self.config.currency
                 ],
+                "include_net_worth": True,
             }
+            if account.opening_balance:
+                # firefly iii will not update date unless balance is non-zero
+                data.update({"opening_balance": account.opening_balance, "opening_balance_date": account.opening_date})
             if account.role is ImportData.Account.Role.credit_card:
                 data["credit_card_type"] = "monthlyFull"
                 data["monthly_payment_date"] = account.monthly_payment_date
@@ -557,7 +637,8 @@ class Importer:
             if account.name in self.firefly_data.asset_accounts:
                 needs_update = False
                 for k, v in data.items():
-                    if existing_account_data[account.name]["attributes"].get(k) != v:
+                    if not _firefly_compare(v, existing_account_data[account.name]["attributes"].get(k)):
+                        print(account.name, k, existing_account_data[account.name]["attributes"].get(k), v)
                         needs_update = True
                         break
                 if needs_update:
