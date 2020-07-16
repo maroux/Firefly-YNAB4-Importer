@@ -899,18 +899,29 @@ class Importer:
                     "notes": tx.notes,
                     "reconciled": tx.reconciled,
                 }
-                if isinstance(tx, (ImportData.TransactionGroup.Deposit, ImportData.TransactionGroup.Withdrawal)):
+                if isinstance(tx, ImportData.TransactionGroup.Deposit):
                     tx_data.update(
                         {
+                            "source_id": int(self.firefly_data.revenue_accounts[tx.payee]["id"]),
+                            "destination_id": int(self.firefly_data.asset_accounts[tx.account]["id"]),
                             "budget_id": int(self.firefly_data.budgets[tx.budget]["id"]),
                             "category_id": self.firefly_data.categories[tx.category],
                         }
                     )
-                if isinstance(tx, ImportData.TransactionGroup.Transfer):
+                elif isinstance(tx, ImportData.TransactionGroup.Withdrawal):
                     tx_data.update(
                         {
-                            "source_id": self.firefly_data.asset_accounts[tx.from_account],
-                            "destination_id": self.firefly_data.asset_accounts[tx.to_account],
+                            "source_id": int(self.firefly_data.asset_accounts[tx.account]["id"]),
+                            "destination_id": int(self.firefly_data.expense_accounts[tx.payee]["id"]),
+                            "budget_id": int(self.firefly_data.budgets[tx.budget]["id"]),
+                            "category_id": self.firefly_data.categories[tx.category],
+                        }
+                    )
+                elif isinstance(tx, ImportData.TransactionGroup.Transfer):
+                    tx_data.update(
+                        {
+                            "source_id": int(self.firefly_data.asset_accounts[tx.from_account]["id"]),
+                            "destination_id": int(self.firefly_data.asset_accounts[tx.to_account]["id"]),
                         }
                     )
                     if hasattr(tx, "foreign_amount"):
