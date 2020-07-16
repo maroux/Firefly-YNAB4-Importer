@@ -1,3 +1,4 @@
+import calendar
 import csv
 import dataclasses
 import enum
@@ -15,7 +16,7 @@ import funcy
 import requests
 import toml
 
-YNAB_FIELDS = [
+YNAB_TRANSACTION_FIELDS = [
     # Which account is this entry for?
     "Account",
     # Colored flags
@@ -30,6 +31,7 @@ YNAB_FIELDS = [
     "Category",
     # Category group
     "Master Category",
+    # Actual category
     "Sub Category",
     # Notes
     "Memo",
@@ -43,11 +45,28 @@ YNAB_FIELDS = [
     "Running Balance",
 ]
 
+YNAB_BUDGET_FIELDS = [
+    # Which month does this apply to? In format: MMMM YYYY
+    "Month",
+    # Concatenation of Master and Sub category
+    "Category",
+    # Category group
+    "Master Category",
+    # Actual category
+    "Sub Category",
+    # Amount budgets
+    "Budgeted",
+    # Total outflows in this budget-month - ignored for the purpose of import
+    "Outflows",
+    # Current balance in this budget - ignored for the purpose of import
+    "Category Balance",
+]
+
 
 @dataclasses.dataclass
 class YNABTransaction:
     """
-    Source data from YNAB register (refer to YNAB_FIELDS for docs)
+    Source data from YNAB register (refer to YNAB_TRANSACTION_FIELDS for docs)
     """
 
     account: str
@@ -60,8 +79,31 @@ class YNABTransaction:
     memo: str
     outflow: Decimal
     inflow: Decimal
-    cleared: bool
+    cleared: str
     running_balance: Decimal
+
+
+@dataclasses.dataclass
+class YNABBudget:
+    """
+    Source data from YNAB budget (refer to YNAB_BUDGET_FIELDS for docs)
+    """
+
+    month: arrow.Arrow
+    category: str
+    master_category: str
+    sub_category: str
+    budgeted: Decimal
+    outflows: Decimal
+    category_balance: Decimal
+
+    @property
+    def is_hidden(self):
+        return self.master_category == "Hidden Categories"
+
+    @property
+    def is_pre_ynab(self):
+        return self.category.startswith("Pre-YNAB Debt")
 
 
 @dataclasses.dataclass
@@ -104,6 +146,11 @@ class Config:
 
     # Mapping for renaming payees
     payee_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+    # Mapping for concatenated budget names to budget name
+    budget_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+    skip_budget_limits_import: bool = False
 
     # Which YNAB field to use for category?
     # Category: Everyday Expenses:Household
@@ -155,6 +202,7 @@ class ImportData:
             description: str
             notes: str
             tags: List[str]
+            reconciled: bool
 
         @dataclasses.dataclass
         class Withdrawal(TransactionMetadata):
@@ -180,9 +228,25 @@ class ImportData:
         title: str = ""
         transactions: List[Union[Withdrawal, Deposit, Transfer]] = dataclasses.field(default_factory=list)
 
+    @dataclasses.dataclass
+    class Budget:
+        name: str
+        active: bool = True
+
+    @dataclasses.dataclass
+    class BudgetHistory:
+        name: str
+        amount: Decimal
+        start: arrow.Arrow
+        end: arrow.Arrow
+
     asset_accounts: List[Account] = dataclasses.field(default_factory=list)
     revenue_accounts: List[str] = dataclasses.field(default_factory=list)
     expense_accounts: List[str] = dataclasses.field(default_factory=list)
+
+    categories: List[str] = dataclasses.field(default_factory=list)
+    budgets: List[Budget] = dataclasses.field(default_factory=list)
+    budget_history: List[BudgetHistory] = dataclasses.field(default_factory=list)
 
     transaction_groups: List[TransactionGroup] = dataclasses.field(default_factory=list)
 
@@ -194,6 +258,10 @@ class FireflyData:
     """
 
     currencies: Dict[str, int] = dataclasses.field(default_factory=dict)
+    categories: Dict[str, int] = dataclasses.field(default_factory=dict)
+    budgets: Dict[str, dict] = dataclasses.field(default_factory=dict)
+    budget_limits: Dict[Tuple[str, arrow.Arrow, arrow.Arrow], dict] = dataclasses.field(default_factory=dict)
+    available_budgets: Dict[Tuple[arrow.Arrow, arrow.Arrow], dict] = dataclasses.field(default_factory=dict)
     asset_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
     revenue_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
     expense_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
@@ -220,7 +288,7 @@ def _is_transfer(tx: YNABTransaction) -> bool:
     return "Transfer : " in tx.payee
 
 
-def _firefly_compare(obj, firefly_obj) -> bool:
+def _firefly_compare(obj: dict, firefly_obj: dict) -> bool:
     if isinstance(obj, arrow.Arrow):
         return obj.format("YYYY-MM-DD") == firefly_obj
     elif isinstance(obj, Decimal) and firefly_obj is not None:
@@ -228,6 +296,15 @@ def _firefly_compare(obj, firefly_obj) -> bool:
     elif firefly_obj is None:
         return obj == 0
     return obj == firefly_obj
+
+
+def _firefly_needs_update(obj: dict, firefly_obj: dict) -> bool:
+    needs_update = False
+    for k, v in obj.items():
+        if not _firefly_compare(v, firefly_obj["attributes"].get(k)):
+            needs_update = True
+            break
+    return needs_update
 
 
 class Session(requests.Session):
@@ -279,7 +356,7 @@ class Session(requests.Session):
 class Importer:
     MEMO_RE = re.compile(r".*([A-Z]{3})\s+([0-9,\\.]+);?.*")
 
-    def __init__(self, config_path, register_path):
+    def __init__(self, config_path, register_path, budget_path):
         self.firefly_url = os.environ["FIREFLY_III_URL"].rstrip("/")
         self.firefly_token = os.environ["FIREFLY_III_ACCESS_TOKEN"]
 
@@ -289,11 +366,13 @@ class Importer:
         print(f"Loaded config for import into {self.firefly_url}")
 
         self.register_path = register_path
+        self.budget_path = budget_path
 
         self.data = ImportData()
         self.firefly_data = FireflyData()
 
         self.all_transactions: List[YNABTransaction] = None
+        self.all_budgets: List[YNABBudget] = None
 
         self._import_tag = f"import-{arrow.now().format('YYYY-MM-DDTHH-MM')}"
 
@@ -303,13 +382,18 @@ class Importer:
         if not dry_run:
             self._verify_connection()
 
-        self._read_register()
+        self._read_ynab_data()
 
+        self._process_budgets()
         self._process_accounts()
         self._process_transactions()
 
         if not dry_run:
             self._create_currencies()
+            self._create_categories()
+            self._create_budgets()
+            self._create_budget_limits()
+            self._create_available_budgets()
             self._create_accounts()
             self._create_transactions()
 
@@ -346,13 +430,15 @@ class Importer:
             )
         return amount * conv_fallback
 
-    def _category(self, tx: YNABTransaction) -> str:
+    def _category(self, tx: Union[YNABTransaction, YNABBudget]) -> str:
         return getattr(tx, _ynab_field_name(self.config.category_field))
 
-    def _budget(self, tx: YNABTransaction) -> str:
+    def _budget(self, tx: Union[YNABTransaction, YNABBudget]) -> str:
+        budget = getattr(tx, _ynab_field_name(self.config.budget_field))
         if tx.master_category == "Hidden Categories":
-            return ""
-        return getattr(tx, _ynab_field_name(self.config.budget_field))
+            budget = budget.split("`")[1].strip() + " (hidden)"
+        budget = budget.strip()
+        return self.config.budget_mapping.get(tx.category, budget)
 
     def _description(self, tx: YNABTransaction) -> str:
         if not self.config.memo_to_description:
@@ -408,14 +494,13 @@ class Importer:
                 self._acc_config(tx.account).currency == self._acc_config(to_account).currency
             ), f"Can't handle transaction between two different foreign accounts: {tx}"
 
-    def _read_register(self):
-        assert not self.all_transactions, "Already read!"
+    def _read_ynab_data(self):
+        assert not self.all_transactions and not self.all_budgets, "Already read!"
         with open(self.register_path) as f:
-            reader = csv.DictReader(f, fieldnames=YNAB_FIELDS)
+            reader = csv.DictReader(f, fieldnames=YNAB_TRANSACTION_FIELDS)
             # skip header
             next(reader)
             all_transactions = list(reader)
-        print(f"Loaded {len(all_transactions)} transactions")
         self.all_transactions = [
             YNABTransaction(
                 account=tx["Account"],
@@ -428,7 +513,7 @@ class Importer:
                 memo=tx["Memo"],
                 outflow=_to_amount(tx["Outflow"]),
                 inflow=_to_amount(tx["Inflow"]),
-                cleared=tx["Cleared"] == "R",
+                cleared=tx["Cleared"],
                 running_balance=_to_amount(tx["Running Balance"]),
             )
             for tx in all_transactions
@@ -439,6 +524,45 @@ class Importer:
             key=lambda tx: (tx.date, tx.inflow - tx.outflow),
             reverse=True,
         )
+        print(f"Loaded {len(self.all_transactions)} transactions")
+
+        with open(self.budget_path) as f:
+            reader = csv.DictReader(f, fieldnames=YNAB_BUDGET_FIELDS)
+            # skip header
+            next(reader)
+            all_budgets = list(reader)
+        self.all_budgets = [
+            YNABBudget(
+                month=arrow.get(bg["Month"], "MMMM YYYY"),
+                category=bg["Category"],
+                master_category=bg["Master Category"],
+                sub_category=bg["Sub Category"],
+                budgeted=_to_amount(bg["Budgeted"]),
+                outflows=_to_amount(bg["Outflows"]),
+                category_balance=_to_amount(bg["Category Balance"]),
+            )
+            for bg in all_budgets
+        ]
+        print(f"Loaded {len(self.all_budgets)} budgets")
+
+    def _process_budgets(self):
+        self.data.categories = list({self._category(bg) for bg in self.all_budgets if self._category(bg)})
+        self.data.budgets = [
+            ImportData.Budget(name=budget, active=not hidden)
+            for budget, hidden in {
+                (self._budget(bg), bg.is_hidden) for bg in self.all_budgets if not bg.is_pre_ynab and self._budget(bg)
+            }
+        ]
+        self.data.budget_history = [
+            ImportData.BudgetHistory(
+                name=self._budget(bg),
+                amount=bg.budgeted,
+                start=bg.month,
+                end=bg.month.replace(day=calendar.monthrange(bg.month.year, bg.month.month)[1]),
+            )
+            for bg in self.all_budgets
+            if not bg.is_pre_ynab and self._budget(bg) and bg.budgeted
+        ]
 
     def _process_accounts(self):
         account_names = {tx.account for tx in self.all_transactions}
@@ -542,6 +666,7 @@ class Importer:
                         foreign_amount=self._transfer_foreign_amount(tx),
                         notes=self._notes(tx),
                         tags=self._tags(tx),
+                        reconciled=tx.cleared == "R",
                     )
                     transaction_group.transactions.append(transfer)
                     transfers_count += 1
@@ -556,6 +681,7 @@ class Importer:
                         category=self._category(tx),
                         notes=self._notes(tx),
                         tags=self._tags(tx),
+                        reconciled=tx.cleared == "R",
                     )
                     transaction_group.transactions.append(withdrawal)
                     withdrawals_count += 1
@@ -570,6 +696,7 @@ class Importer:
                         category=self._category(tx),
                         notes=self._notes(tx),
                         tags=self._tags(tx),
+                        reconciled=tx.cleared == "R",
                     )
                     transaction_group.transactions.append(deposit)
                     deposits_count += 1
@@ -606,6 +733,90 @@ class Importer:
             elif data["attributes"]["enabled"]:
                 self._session.post(f"{self.firefly_url}/api/v1/currencies/{code}/disable")
 
+    def _create_budgets(self) -> None:
+        response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/budgets")
+
+        for data in response["data"]:
+            self.firefly_data.budgets[data["attributes"]["name"]] = data
+
+        for budget in self.data.budgets:
+            data = {
+                "name": budget.name,
+                "active": budget.active,
+            }
+
+            try:
+                if budget.name in self.firefly_data.budgets:
+                    if _firefly_needs_update(data, self.firefly_data.budgets[budget.name]):
+                        self._session.put(
+                            f"{self.firefly_url}/api/v1/budgets/{self.firefly_data.budgets[budget.name]['id']}",
+                            json=data,
+                        )
+                else:
+                    response = self._session.post(f"{self.firefly_url}/api/v1/budgets", json=data)
+                    self.firefly_data.budgets[budget.name] = response.json()["data"]
+            except requests.HTTPError as e:
+                if e.response.status_code == 500:
+                    # ignore, because Firefly seems to do the right thing but fail still!?
+                    pass
+                else:
+                    raise
+        print(f"Created {len(self.firefly_data.budgets)} budgets")
+
+    def _create_budget_limits(self) -> None:
+        if self.config.skip_budget_limits_import:
+            print("Skipping budget limits import as requested")
+            return
+
+        for budget, budget_data in self.firefly_data.budgets.items():
+            response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/budgets/{budget_data['id']}/limits")
+
+            for data in response["data"]:
+                self.firefly_data.budget_limits[
+                    (budget, arrow.get(data["attributes"]["start"]), arrow.get(data["attributes"]["end"]))
+                ] = data
+
+        for bg_hist in self.data.budget_history:
+            data = {
+                "budget_id": int(self.firefly_data.budgets[bg_hist.name]["id"]),
+                "start": bg_hist.start,
+                "end": bg_hist.end,
+                "amount": bg_hist.amount,
+            }
+
+            firefly_data = self.firefly_data.budget_limits.get((bg_hist.name, bg_hist.start, bg_hist.end))
+            if firefly_data:
+                if _firefly_needs_update(data, firefly_data):
+                    self._session.put(
+                        f"{self.firefly_url}/api/v1/budgets/limits/{firefly_data['id']}", json=data,
+                    )
+            else:
+                response = self._session.post(
+                    f"{self.firefly_url}/api/v1/budgets/{data['budget_id']}/limits", json=data
+                )
+                self.firefly_data.budget_limits[(bg_hist.name, bg_hist.start, bg_hist.end)] = response.json()["data"]
+        print(f"Created {len(self.firefly_data.budget_limits)} budget limits")
+
+    def _create_available_budgets(self) -> None:
+        print(
+            "SKIPPED creating available budgets since this requires more complex calculation based on previous months "
+            "in-flow and such"
+        )
+
+    def _create_categories(self) -> None:
+        response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/categories")
+
+        for data in response["data"]:
+            self.firefly_data.categories[data["attributes"]["name"]] = int(data["id"])
+
+        for category in self.data.categories:
+            if category in self.firefly_data.categories:
+                continue
+
+            response = self._session.post(f"{self.firefly_url}/api/v1/categories", json={"name": category})
+            self.firefly_data.categories[category] = int(response.json()["data"]["id"])
+        print(f"Created {len(self.firefly_data.categories)} categories")
+
     def _create_accounts(self) -> None:
         response = self._session.get_all_pages(f"{self.firefly_url}/api/v1/accounts")
 
@@ -620,7 +831,7 @@ class Importer:
                 raise ValueError(f"Found account of unknown type: {data['attributes']['type']}")
 
         self._create_asset_accounts()
-        self._create_revenue_and_accounts()
+        self._create_revenue_and_expense_accounts()
 
     def _create_asset_accounts(self) -> None:
         for account in self.data.asset_accounts:
@@ -642,22 +853,17 @@ class Importer:
                 data["monthly_payment_date"] = account.monthly_payment_date
 
             if account.name in self.firefly_data.asset_accounts:
-                needs_update = False
-                for k, v in data.items():
-                    if not _firefly_compare(v, self.firefly_data.asset_accounts[account.name]["attributes"].get(k)):
-                        needs_update = True
-                        break
-                if needs_update:
+                if _firefly_needs_update(data, self.firefly_data.asset_accounts[account.name]):
                     self._session.put(
                         f"{self.firefly_url}/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}",
                         json=data,
                     )
             else:
                 response = self._session.post(f"{self.firefly_url}/api/v1/accounts", json=data)
-                self.firefly_data.asset_accounts[account.name] = response.json()["data"]["id"]
+                self.firefly_data.asset_accounts[account.name] = response.json()["data"]
         print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
 
-    def _create_revenue_and_accounts(self) -> None:
+    def _create_revenue_and_expense_accounts(self) -> None:
         for (account_type, accounts, firefly_data) in [
             ("revenue", self.data.revenue_accounts, self.firefly_data.revenue_accounts),
             ("expense", self.data.expense_accounts, self.firefly_data.expense_accounts),
@@ -671,12 +877,7 @@ class Importer:
                 }
 
                 if account in firefly_data:
-                    needs_update = False
-                    for k, v in data.items():
-                        if not _firefly_compare(v, firefly_data[account]["attributes"].get(k)):
-                            needs_update = True
-                            break
-                    if needs_update:
+                    if _firefly_needs_update(data, firefly_data[account]):
                         self._session.put(
                             f"{self.firefly_url}/api/v1/accounts/{firefly_data[account]['id']}", json=data,
                         )
@@ -686,9 +887,47 @@ class Importer:
             print(f"Created {len(firefly_data)} {account_type} accounts")
 
     def _create_transactions(self) -> None:
-        pass
+        for tx_group in self.data.transaction_groups:
+            transactions_data = []
+            for tx in tx_group.transactions:
+                tx_data = {
+                    "type": tx.__class__.__name__.lower(),
+                    "date": tx.date,
+                    "amount": tx.amount,
+                    "description": tx.description,
+                    "tags": tx.tags,
+                    "notes": tx.notes,
+                    "reconciled": tx.reconciled,
+                }
+                if isinstance(tx, (ImportData.TransactionGroup.Deposit, ImportData.TransactionGroup.Withdrawal)):
+                    tx_data.update(
+                        {
+                            "budget_id": int(self.firefly_data.budgets[tx.budget]["id"]),
+                            "category_id": self.firefly_data.categories[tx.category],
+                        }
+                    )
+                if isinstance(tx, ImportData.TransactionGroup.Transfer):
+                    tx_data.update(
+                        {
+                            "source_id": self.firefly_data.asset_accounts[tx.from_account],
+                            "destination_id": self.firefly_data.asset_accounts[tx.to_account],
+                        }
+                    )
+                    if hasattr(tx, "foreign_amount"):
+                        tx_data.update({"foreign_amount": tx.foreign_amount})
+                transactions_data.append(tx_data)
+            data = {
+                "error_if_duplicate_hash": True,
+                "apply_rules": False,
+                "group_title": tx_group.title,
+                "transactions": transactions_data,
+            }
+            self._session.post(
+                f"{self.firefly_url}/api/v1/transactions", json=data,
+            )
+            raise ValueError
 
 
 if __name__ == "__main__":
-    importer = Importer(sys.argv[1], sys.argv[2])
+    importer = Importer(sys.argv[1], sys.argv[2], sys.argv[3])
     importer.run()
