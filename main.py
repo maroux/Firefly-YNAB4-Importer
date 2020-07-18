@@ -8,9 +8,11 @@ import re
 import sys
 from collections import defaultdict
 from decimal import Decimal
+from functools import partial
 from io import StringIO
+from itertools import chain
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, ClassVar, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import arrow
 import dacite
@@ -86,6 +88,90 @@ class YNABTransaction:
     cleared: str
     running_balance: Decimal
 
+    # Interpreted from memo etc
+    foreign_amount: Optional[Union[Decimal, Callable[[], Decimal]]] = None
+    foreign_currency: Optional[str] = None
+
+    MEMO_RE: ClassVar = re.compile(r"^.*([A-Z]{3})\s+([0-9,\\.]+)(K)?;?(.*)?$")
+
+    @property
+    def is_expense(self) -> bool:
+        return self.outflow > 0
+
+    @property
+    def is_deposit(self) -> bool:
+        return self.inflow > 0
+
+    @property
+    def is_transfer(self) -> bool:
+        return "Transfer : " in self.payee
+
+    @property
+    def transfer_account(self) -> str:
+        if " / Transfer : " in self.payee:
+            return self.payee.split(" / ")[1].split(" : ")[1]
+        return self.payee.split(" : ")[1]
+
+    def fix_transfer(self) -> "YNABTransaction":
+        """
+        Amount in Firefly needs to be +ve. For transfer transactions, this means tx.account always needs to be the
+        account from which money goes out. Since YNAB transactions could have it the wrong way around, this method is
+        used to correct such transactions.
+        """
+        if not self.is_transfer:
+            return self
+
+        tx = YNABTransferTransaction(**dataclasses.asdict(self))
+        account_from_payee = self.transfer_account
+
+        if self.outflow > 0:
+            return dataclasses.replace(tx, payee=account_from_payee)
+
+        real_from_account = account_from_payee
+        real_to_account = self.account
+
+        return dataclasses.replace(
+            tx, account=real_from_account, payee=real_to_account, outflow=self.inflow, inflow=self.outflow,
+        )
+
+    def fix_foreign(
+        self, config: "Config", forex_calculator: Callable[[str, Decimal, arrow.Arrow], Decimal]
+    ) -> "YNABTransaction":
+        """
+        Populates foreign amount and currency code if this is a transaction involving a foreign and a default account
+        """
+        if not config.is_foreign(self.account) and not config.is_foreign(self.payee):
+            return self
+
+        if self.is_transfer and config.is_foreign(self.account) and config.is_foreign(self.payee):
+            assert (
+                config.account(self.account).currency == config.account(self.payee).currency
+            ), f"Can't handle transaction between two different foreign accounts: {self}"
+
+        foreign_account = self.account if config.is_foreign(self.account) else self.payee
+        foreign_currency_code = config.account(foreign_account).currency
+
+        # try to use memo to find real value at the time of transaction
+        m = self.MEMO_RE.match(self.memo)
+        if m and m.group(1) == foreign_currency_code:
+            # use memo - yaay!
+            amount = Decimal(m.group(2).replace(",", ""))
+            # thousand multiplier: 1K => 1,000
+            if m.group(2) == "K":
+                amount *= 1000
+            memo = (m.group(4) or "").strip()
+            return dataclasses.replace(self, foreign_amount=amount, foreign_currency=foreign_currency_code, memo=memo)
+
+        _calculator = partial(forex_calculator, foreign_currency_code, self.inflow or self.outflow, self.date)
+        return dataclasses.replace(self, foreign_amount=_calculator, foreign_currency=foreign_currency_code)
+
+
+@dataclasses.dataclass(frozen=True)
+class YNABTransferTransaction(YNABTransaction):
+    @property
+    def is_transfer(self) -> bool:
+        return True
+
 
 @dataclasses.dataclass(frozen=True)
 class YNABBudget:
@@ -140,9 +226,6 @@ class Config:
     # All of your YNAB accounts - only need to add here if there's some customization to be done.
     accounts: Dict[str, Account] = dataclasses.field(default_factory=dict)
 
-    # Mapping of currency conversion fallback if foreign amount can't be automatically determined
-    currency_conv_fallback: Dict[str, Decimal] = dataclasses.field(default_factory=dict)
-
     # default currency
     currency: str = "USD"
 
@@ -175,6 +258,15 @@ class Config:
     # This is also the value that'll get used if `memo_to_description` is false.
     empty_description: str = "(empty description)"
 
+    def account(self, acc: str) -> Account:
+        return self.accounts.get(acc, Config.Account())
+
+    def is_foreign(self, acc: str) -> bool:
+        return self.account(acc).currency and self.account(acc).currency != self.currency
+
+    def parse_date(self, dt: str) -> arrow.Arrow:
+        return arrow.get(dt, self.date_format)
+
 
 @dataclasses.dataclass
 class ImportData:
@@ -202,7 +294,7 @@ class ImportData:
         @dataclasses.dataclass(frozen=True)
         class TransactionMetadata:
             date: arrow.Arrow
-            amount: Decimal
+            amount: Union[Decimal, Callable[[], Decimal]]
             description: str
             notes: str
             tags: List[str]
@@ -229,7 +321,7 @@ class ImportData:
             from_account: str
             to_account: str
             # set if exactly one of: from, to is foreign currency account
-            foreign_amount: Decimal = None
+            foreign_amount: Union[Decimal, Callable[[], Decimal]] = None
             # must be set if foreign_amount is set
             foreign_currency_code: str = None
 
@@ -271,6 +363,8 @@ class FireflyData:
     Data in firefly - mostly primary keys (ids) for various objects
     """
 
+    # XXX don't use defaultdict here (https://bugs.python.org/issue35540
+
     currencies: Dict[str, int] = dataclasses.field(default_factory=dict)
     categories: Dict[str, int] = dataclasses.field(default_factory=dict)
     budgets: Dict[str, dict] = dataclasses.field(default_factory=dict)
@@ -279,6 +373,8 @@ class FireflyData:
     asset_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
     revenue_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
     expense_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
+    # map of foreign currency to map of date to converstion ratio for converting from default currency to this currency
+    forex_conversion: Dict[Tuple[str, arrow.Arrow], Decimal] = dataclasses.field(default_factory=dict)
 
 
 def create_transaction():
@@ -301,37 +397,6 @@ def _to_amount(s: str) -> Decimal:
 
 def _ynab_field_name(s: str) -> str:
     return s.lower().replace(" ", "_")
-
-
-def _is_transfer(tx: YNABTransaction) -> bool:
-    return "Transfer : " in tx.payee
-
-
-def _transfer_account(tx: YNABTransaction) -> str:
-    if " / Transfer : " in tx.payee:
-        return tx.payee.split(" / ")[1].split(" : ")[1]
-    return tx.payee.split(" : ")[1]
-
-
-def _correct_transfer_to_from(tx: YNABTransaction) -> YNABTransaction:
-    """
-    Amount in Firefly needs to be +ve. For transfer transactions, this means tx.account always needs to be the
-    account from which money goes out. Since YNAB transactions could have it the wrong way around, this method is
-    used to correct such transactions.
-    """
-    assert _is_transfer(tx)
-
-    account_from_payee = _transfer_account(tx)
-
-    if tx.outflow > 0:
-        return dataclasses.replace(tx, payee=account_from_payee)
-
-    real_from_account = account_from_payee
-    real_to_account = tx.account
-
-    return dataclasses.replace(
-        tx, account=real_from_account, payee=real_to_account, outflow=tx.inflow, inflow=tx.outflow,
-    )
 
 
 def _firefly_compare(obj: dict, firefly_obj: dict) -> bool:
@@ -368,7 +433,12 @@ def _firefly_create_transaction_errors(
     other_tx_errors = defaultdict(dict)
     other_errors = {}
     # sample response:
-    # b'{"message":"The given data was invalid.","errors":{"transactions.0.description":["Duplicate of transaction #7995."]}}'
+    # {
+    #   "message": "The given data was invalid.",
+    #   "errors": {
+    #       "transactions.0.description": ["Duplicate of transaction #7995."]
+    #    }
+    # }
     for field, field_errors in response.json()["errors"].items():
         split = field.split(".")
         field = split[0]
@@ -396,10 +466,14 @@ def _split_key(tx: YNABTransaction) -> tuple:
 
     This method returns a key appropriate for grouping splits if and only if they satisfy these constraints
     """
-    if _is_transfer(tx):
-        return tx.account, _transfer_account(tx), None, tx.date, tx.running_balance
+    if tx.is_transfer:
+        return tx.account, tx.transfer_account, None, tx.date, tx.running_balance
     else:
-        return tx.account, None, tx.inflow > 0, tx.date, tx.running_balance
+        return tx.account, None, tx.is_deposit, tx.date, tx.running_balance
+
+
+def end_of_month(date: arrow.Arrow) -> arrow.Arrow:
+    return date.replace(day=calendar.monthrange(date.year, date.month)[1])
 
 
 class ProgressBar:
@@ -465,6 +539,9 @@ class FireflySession(requests.Session):
 
     @staticmethod
     def _json_default(obj):
+        if callable(obj):
+            # forex calculator is lazy
+            obj = obj()
         if isinstance(obj, Decimal):
             int_val = int(obj)
             if int_val == obj:
@@ -512,8 +589,6 @@ class FireflySession(requests.Session):
 
 
 class Importer:
-    MEMO_RE = re.compile(r"^.*([A-Z]{3})\s+([0-9,\\.]+)(K)?(;.*)?$")
-
     def __init__(
         self,
         firefly_url: str,
@@ -573,38 +648,28 @@ class Importer:
             self._create_payee_accounts("expense")
             self._create_transactions()
 
-    def _acc_config(self, acc: str) -> Config.Account:
-        return self.config.accounts.get(acc, Config.Account())
-
-    def _is_foreign(self, acc: str) -> bool:
-        return self._acc_config(acc).currency and self._acc_config(acc).currency != self.config.currency
-
-    def _parse_date(self, dt: str) -> arrow.Arrow:
-        return arrow.get(dt, self.config.date_format)
-
     def _payee(self, tx: YNABTransaction) -> str:
         return self.config.payee_mapping.get(tx.payee.strip(), tx.payee.strip())
 
-    def _amount(self, tx: YNABTransaction) -> Decimal:
+    def _forex_calculator(self, currency_code: str, amount: Decimal, date: arrow.Arrow) -> Decimal:
+        conv_rate = self.firefly_data.forex_conversion.get((currency_code, date))
+        if conv_rate is None:
+            response = requests.get(
+                f"https://api.exchangeratesapi.io/{date.format('YYYY-MM-DD')}",
+                params={"base": self.config.currency, "symbols": currency_code},
+            )
+            conv_rate = Decimal(response.json()["rates"][currency_code])
+            self.firefly_data.forex_conversion[(currency_code, date)] = conv_rate
+            self._update_cache()
+        return amount * conv_rate
+
+    def _amount(self, tx: YNABTransaction) -> Union[Decimal, Callable[[], Decimal]]:
         # exactly one of these would be non-zero
         amount = tx.outflow or tx.inflow
-        if not self._is_foreign(tx.account):
+        if self.config.is_foreign(tx.account):
+            return tx.foreign_amount
+        else:
             return amount
-
-        # for foreign accounts, try to use memo to find real value at the time of transaction
-        m = self.MEMO_RE.match(tx.memo)
-        foreign_currency_code = self._acc_config(tx.account).currency
-        if m and m.group(1) == self._acc_config(tx.account).currency:
-            # use memo - yaay!
-            return Decimal(m.group(2).replace(",", "")) * (-1 if tx.inflow > 0 else 1)
-
-        conv_fallback = self.config.currency_conv_fallback.get(foreign_currency_code)
-        if not conv_fallback:
-            raise ValueError(
-                f"Unable to determine foreign amount for {tx}. Memo must be of form: [CURRENCY CODE] "
-                f"[AMOUNT]. Alternatively, set config.currency_conv_fallback."
-            )
-        return amount * conv_fallback
 
     def _category(self, tx: Union[YNABTransaction, YNABBudget]) -> str:
         return getattr(tx, _ynab_field_name(self.config.category_field))
@@ -622,9 +687,6 @@ class Importer:
         memo = tx.memo.strip()
         if "(Split" in memo:
             memo = memo.split(")")[1].strip()
-        # for foreign transactions, memo _may_ contain foreign currency info
-        if self._is_foreign(tx.account) and (m := self.MEMO_RE.match(tx.memo)) and m.group(4):
-            memo = m.group(4).strip()
         return memo or self.config.empty_description
 
     def _notes(self, tx: YNABTransaction) -> str:
@@ -634,55 +696,6 @@ class Importer:
 
     def _tags(self, tx: YNABTransaction) -> List[str]:
         return [tx.flag] if tx.flag else []
-
-    def _transfer_foreign_amount(self, tx: YNABTransaction) -> Tuple[Decimal, str]:
-        """
-        Gets foreign amount and currency code if this is a transaction involving a foreign and a default account
-        """
-        # should be the "corrected" version already
-        assert "Transfer : " not in tx.payee
-
-        to_account = tx.payee
-        # From foreign account to default currency account --
-        if self._is_foreign(tx.account) and not self._is_foreign(to_account):
-            # Amount is already computed in `self._amount` above using foreign currency code
-            # Outflow / Inflow corresponds to default currency
-            return tx.outflow or tx.inflow, self.config.currency
-        # From default currency account to foreign account
-        elif not self._is_foreign(tx.account) and self._is_foreign(to_account):
-            foreign_currency_code = self._acc_config(to_account).currency
-            conv_fallback = self.config.currency_conv_fallback.get(foreign_currency_code)
-            fallback_amount = None
-            if conv_fallback:
-                # Amount is default currency
-                fallback_amount = (tx.outflow or tx.inflow) * conv_fallback
-
-            # for foreign accounts, try to use memo to find real value at the time of transaction
-            m = self.MEMO_RE.match(tx.memo)
-            if m and m.group(1) == self._acc_config(to_account).currency:
-                # use memo - yaay!
-                amount = Decimal(m.group(2).replace(",", ""))
-                # thousand multiplier: 1K => 1,000
-                if m.group(2) == "K":
-                    amount *= 1000
-                if fallback_amount:
-                    # verify that amount doesn't mismatch from fallback by more than 20%
-                    # this accounts for 20% fluctuation in currency conversion
-                    assert abs(amount - fallback_amount) / fallback_amount <= 0.20
-                return amount, foreign_currency_code
-
-            if not fallback_amount:
-                raise ValueError(
-                    f"Unable to determine foreign amount for {tx}. Memo must be of form: [CURRENCY CODE] "
-                    f"[AMOUNT]. Alternatively, set config.currency_conv_fallback."
-                )
-            return fallback_amount, foreign_currency_code
-
-        elif self._is_foreign(tx.account) and self._is_foreign(to_account):
-            assert (
-                self._acc_config(tx.account).currency == self._acc_config(to_account).currency
-            ), f"Can't handle transaction between two different foreign accounts: {tx}"
-        return None, None
 
     def _read_ynab_data(self):
         assert not self.all_transactions and not self.all_budgets, "Already read!"
@@ -695,7 +708,7 @@ class Importer:
             YNABTransaction(
                 account=tx["Account"],
                 flag=tx["Flag"],
-                date=self._parse_date(tx["Date"]),
+                date=self.config.parse_date(tx["Date"]),
                 payee=tx["Payee"],
                 category=tx["Category"],
                 master_category=tx["Master Category"],
@@ -708,11 +721,6 @@ class Importer:
             )
             for tx in all_transactions
         ]
-        self.all_transactions = sorted(
-            # YNAB4 display sorts same date transactions by highest inflow first
-            self.all_transactions,
-            key=lambda tx: (tx.date, tx.outflow - tx.inflow),
-        )
         print(f"Loaded {len(self.all_transactions)} transactions")
 
         with open(self.budget_path) as f:
@@ -759,10 +767,7 @@ class Importer:
         )
         self.data.budget_history = [
             ImportData.BudgetHistory(
-                name=self._budget(bg),
-                amount=bg.budgeted,
-                start=bg.month,
-                end=bg.month.replace(day=calendar.monthrange(bg.month.year, bg.month.month)[1]),
+                name=self._budget(bg), amount=bg.budgeted, start=bg.month, end=end_of_month(bg.month),
             )
             for bg in self.all_budgets
             if not bg.is_pre_ynab and self._budget(bg) and bg.budgeted
@@ -781,7 +786,7 @@ class Importer:
 
         for acc in account_names:
             start_date, balance = starting_balances[acc]
-            account_config = self._acc_config(acc)
+            account_config = self.config.account(acc)
             role = ImportData.Account.Role[account_config.role.name]
             monthly_payment_date = None
             if role is ImportData.Account.Role.credit_card:
@@ -798,7 +803,9 @@ class Importer:
                 else:
                     try:
                         monthly_payment_date = next(
-                            tx.date for tx in self.all_transactions if _is_transfer(tx) and _transfer_account(tx) == acc
+                            tx.date
+                            for tx in reversed(self.all_transactions)
+                            if tx.is_transfer and tx.transfer_account == acc
                         )
                     except StopIteration:
                         print(f"[WARN] Couldn't figure out monthly payment date for {acc}, defaulting to 01/01")
@@ -813,10 +820,10 @@ class Importer:
             self.data.asset_accounts.append(account)
 
         self.data.revenue_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if tx.inflow > 0 and not _is_transfer(tx)}
+            {self._payee(tx) for tx in self.all_transactions if tx.is_deposit and not tx.is_transfer}
         )
         self.data.expense_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if tx.outflow > 0 and not _is_transfer(tx)}
+            {self._payee(tx) for tx in self.all_transactions if tx.is_expense and not tx.is_transfer}
         )
         print(
             f"Configured account data for {len(self.data.asset_accounts)} asset accounts, "
@@ -836,11 +843,10 @@ class Importer:
         splits, non_splits = funcy.split(lambda tx: "(Split " in tx.memo, transactions)
         splits_grouped = funcy.group_by(_split_key, splits)
         # process splits first because in case of transfers, we want to split version of Transfer rather than the other
-        all_tx_grouped = list(splits_grouped.values())
-        all_tx_grouped.extend([[tx] for tx in non_splits])
+        all_tx_grouped = chain(splits_grouped.values(), map(lambda x: [x], non_splits))
 
         # because of stable sorting, splits on the same will appear before non-splits on that day
-        all_tx_grouped = sorted(all_tx_grouped, key=lambda tx_group: tx_group[0].date)
+        all_tx_grouped: Iterator[List[YNABTransaction]] = sorted(all_tx_grouped, key=lambda tx_group: tx_group[0].date)
 
         # used to de-dup transactions because YNAB will double-log every transfer
         # map key: tuple of accounts (sorted by name), date, abs(outflow - inflow)
@@ -855,6 +861,9 @@ class Importer:
             )
 
             for tx in tx_group:
+                tx = tx.fix_transfer()
+                tx = tx.fix_foreign(self.config, self._forex_calculator)
+
                 budget = self._budget(tx)
                 if budget:
                     assert budget in self.data.budgets, f"Unable to process transaction with unknown budget: |{budget}|"
@@ -875,9 +884,7 @@ class Importer:
                 # could hash this value but hardly worth it
                 external_id = str(tx.running_balance)
 
-                if _is_transfer(tx):
-                    tx = _correct_transfer_to_from(tx)
-
+                if tx.is_transfer:
                     date = tx.date
                     transfer_seen_map_key = (
                         tuple(sorted([tx.account, tx.payee])),
@@ -888,15 +895,14 @@ class Importer:
                         transfers_seen_map[transfer_seen_map_key] += 1
                         continue
                     transfers_seen_map[transfer_seen_map_key] = 1
-                    foreign_amount, foreign_currency_code = self._transfer_foreign_amount(tx)
                     transfer = ImportData.TransactionGroup.Transfer(
                         from_account=tx.account,
                         to_account=tx.payee,
                         date=date,
                         amount=self._amount(tx),
                         description=self._description(tx),
-                        foreign_amount=foreign_amount,
-                        foreign_currency_code=foreign_currency_code,
+                        foreign_amount=tx.foreign_amount,
+                        foreign_currency_code=tx.foreign_currency,
                         notes=self._notes(tx),
                         tags=self._tags(tx),
                         reconciled=tx.cleared == "R",
@@ -904,7 +910,7 @@ class Importer:
                     )
                     transaction_group.transactions.append(transfer)
                     transfers_count += 1
-                elif tx.outflow > 0:
+                elif tx.is_expense:
                     withdrawal = ImportData.TransactionGroup.Withdrawal(
                         account=tx.account,
                         date=tx.date,
@@ -920,7 +926,7 @@ class Importer:
                     )
                     transaction_group.transactions.append(withdrawal)
                     withdrawals_count += 1
-                elif tx.inflow > 0:
+                elif tx.is_deposit:
                     deposit = ImportData.TransactionGroup.Deposit(
                         account=tx.account,
                         date=tx.date,
@@ -958,6 +964,17 @@ class Importer:
 
         try:
             data = json.loads(self._cache_path.read_text())
+            # make JSON friendly
+            data["forex_conversion"] = {
+                (split[0], arrow.get(split[1])): Decimal(rate)
+                for currency_code_date, rate in data.get("forex_conversion", {}).items()
+                if (split := currency_code_date.split("::"))
+            }
+            data["budget_limits"] = {
+                (split[0], arrow.get(split[1]), arrow.get(split[2])): budget_data
+                for budget_start_end, budget_data in data.get("budget_limits", {}).items()
+                if (split := budget_start_end.split("::"))
+            }
             self.firefly_data = dacite.from_dict(FireflyData, data, config=dacite.Config(strict=True))
         except json.decoder.JSONDecodeError:
             pass
@@ -965,8 +982,18 @@ class Importer:
     def _update_cache(self) -> None:
         if not self._cache_dir.exists():
             self._cache_dir.mkdir(parents=True)
+        d = dataclasses.asdict(self.firefly_data)
+        d["forex_conversion"] = {
+            f"{currency_code}::{date.format('YYYY-MM-DD')}": str(rate)
+            for (currency_code, date), rate in self.firefly_data.forex_conversion.items()
+        }
+        d["budget_limits"] = {
+            f"{budget}::{start.format('YYYY-MM-DD')}::{end.format('YYYY-MM-DD')}": budget_data
+            for (budget, start, end), budget_data in self.firefly_data.budget_limits.items()
+        }
+        data = json.dumps(d)
         with open(self._cache_path, "w") as f:
-            json.dump(dataclasses.asdict(self.firefly_data), f)
+            f.write(data)
 
     def _create_currencies(self) -> None:
         # check cache
@@ -984,7 +1011,7 @@ class Importer:
             if code == self.config.currency:
                 if not data["attributes"]["default"]:
                     self._session.post(f"/api/v1/currencies/{code}/default")
-            if code in [self.config.currency, "INR", "EUR"]:
+            if code in currencies_to_keep:
                 if not data["attributes"]["enabled"]:
                     self._session.post(f"/api/v1/currencies/{code}/enable")
             elif data["attributes"]["enabled"]:
@@ -1085,12 +1112,17 @@ class Importer:
         self._update_cache()
         print(f"Created {len(self.firefly_data.categories)} categories")
 
-    def _create_asset_accounts(self, ignore_cache: bool = False) -> None:
+    def _create_asset_accounts(
+        self, ignore_cache: bool = False, suppress_print: bool = False, date: Optional[arrow.Arrow] = None
+    ) -> None:
         # check cache
         if not ignore_cache and self.firefly_data.asset_accounts:
             return
 
-        response = self._session.get_all_pages("/api/v1/accounts?type=asset")
+        params = {"type": "asset"}
+        if date:
+            params["date"] = date.format("YYYY-MM-DD")
+        response = self._session.get_all_pages("/api/v1/accounts", params=params)
 
         for data in response["data"]:
             self.firefly_data.asset_accounts[data["attributes"]["name"]] = data
@@ -1121,8 +1153,10 @@ class Importer:
             else:
                 response = self._session.post("/api/v1/accounts", json=data)
                 self.firefly_data.asset_accounts[account.name] = response.json()["data"]
-        self._update_cache()
-        print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
+        if not ignore_cache:
+            self._update_cache()
+        if not suppress_print:
+            print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
 
     def _create_payee_accounts(self, account_type: str) -> None:
         assert account_type in ("revenue", "expense")
@@ -1165,16 +1199,16 @@ class Importer:
         """
         Before moving to next month verify running balance to match data against YNAB
         """
-        # re-fetch asset accounts
-        self._create_asset_accounts(ignore_cache=True)
+        # re-fetch asset accounts as of end of month
+        self._create_asset_accounts(ignore_cache=True, suppress_print=True, date=end_of_month(month))
 
         for account, balance in self.data.running_balances[month].items():
-            if self._is_foreign(account):
+            if self.config.is_foreign(account):
                 continue
             firefly_data = self.firefly_data.asset_accounts[account]["attributes"]
-            if month < arrow.get(firefly_data["opening_balance_date"]).replace(day=1):
-                # if pre-opening date, calculation can't be done correctly. This is a bug in your data!
-                continue
+            # if month < arrow.get(firefly_data["opening_balance_date"]).replace(day=1):
+            #     # if pre-opening date, calculation can't be done correctly. This is a bug in your data!
+            #     continue
             firefly_balance = firefly_data["current_balance"]
             if balance != Decimal(str(firefly_balance)):
                 raise ValueError(
@@ -1186,22 +1220,24 @@ class Importer:
     def _create_transactions(self) -> None:
         imported = ignored = 0
         total = len(self.data.transaction_groups)
-        progress_bar = ProgressBar(total, prefix="Import progress:", suffix="Complete", length=50)
+        progress_bar = ProgressBar(total, prefix="Import progress:", suffix="Complete", length=100)
         output = StringIO()
         current_month = self.data.transaction_groups[0].transactions[0].date.replace(day=1)
         try:
             for tx_group in self.data.transaction_groups:
-                tx_month = tx_group.transactions[0].date.replace(day=1)
-                if tx_month != current_month:
-                    self._verify_running_balance(current_month)
-                    print(f"Imported and verified {current_month.format('MMMM YYYY')}")
-                    current_month = tx_month
                 if (self.filter_max_date and tx_group.transactions[0].date > self.filter_max_date) or (
                     self.filter_min_date and tx_group.transactions[0].date < self.filter_min_date
                 ):
                     ignored += 1
                     progress_bar.print(imported + ignored)
                     continue
+
+                tx_month = tx_group.transactions[0].date.replace(day=1)
+                if tx_month != current_month:
+                    self._verify_running_balance(current_month)
+                    print(f"Imported and verified {current_month.format('MMMM YYYY')}")
+                    current_month = tx_month
+
                 transactions_data = []
                 for tx in tx_group.transactions:
                     tx_data = {
