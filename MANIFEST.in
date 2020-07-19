@@ -1,0 +1,5 @@
+include README.rst setup.py MANIFEST.in
+global-include README.rst README.rst
+prune deps .cache .idea .mypy_cache
+graft tests
+global-exclude *~

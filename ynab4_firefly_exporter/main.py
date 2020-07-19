@@ -19,8 +19,7 @@ import dacite
 import funcy
 import requests
 import toml
-
-VERSION = "0.1"
+from ynab4_firefly_exporter import VERSION
 
 YNAB_TRANSACTION_FIELDS = [
     # Which account is this entry for?
@@ -262,7 +261,7 @@ class Config:
         return self.accounts.get(acc, Config.Account())
 
     def is_foreign(self, acc: str) -> bool:
-        return self.account(acc).currency and self.account(acc).currency != self.currency
+        return bool(self.account(acc).currency and self.account(acc).currency != self.currency)
 
     def parse_date(self, dt: str) -> arrow.Arrow:
         return arrow.get(dt, self.date_format)
@@ -321,9 +320,9 @@ class ImportData:
             from_account: str
             to_account: str
             # set if exactly one of: from, to is foreign currency account
-            foreign_amount: Union[Decimal, Callable[[], Decimal]] = None
+            foreign_amount: Optional[Union[Decimal, Callable[[], Decimal]]] = None
             # must be set if foreign_amount is set
-            foreign_currency_code: str = None
+            foreign_currency_code: Optional[str] = None
 
         title: str = ""
         transactions: List[Union[Withdrawal, Deposit, Transfer]] = dataclasses.field(default_factory=list)
@@ -429,9 +428,9 @@ def _firefly_create_transaction_errors(
         other_errors is a dict of other fields to list of errors
     """
 
-    dup_errors = {}
-    other_tx_errors = defaultdict(dict)
-    other_errors = {}
+    dup_errors: Dict[int, int] = {}
+    other_tx_errors: Dict[int, Dict[str, List[str]]] = defaultdict(dict)
+    other_errors: Dict[str, List[str]] = {}
     # sample response:
     # {
     #   "message": "The given data was invalid.",
@@ -553,7 +552,7 @@ class FireflySession(requests.Session):
             return obj.format("YYYY-MM-DD")
         raise TypeError
 
-    def request(self, method, url, **kwargs) -> requests.Response:
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
         if not url.startswith("https://"):
             url = f"{self.firefly_url}{url}"
         print_failures = True
@@ -618,8 +617,8 @@ class Importer:
         self.data = ImportData()
         self.firefly_data = FireflyData()
 
-        self.all_transactions: List[YNABTransaction] = None
-        self.all_budgets: List[YNABBudget] = None
+        self.all_transactions: List[YNABTransaction] = []
+        self.all_budgets: List[YNABBudget] = []
 
         self._session = FireflySession(firefly_url, firefly_token)
 
@@ -667,6 +666,7 @@ class Importer:
         # exactly one of these would be non-zero
         amount = tx.outflow or tx.inflow
         if self.config.is_foreign(tx.account):
+            assert tx.foreign_amount
             return tx.foreign_amount
         else:
             return amount
@@ -1022,9 +1022,9 @@ class Importer:
         # check cache
         if self.firefly_data.budgets:
             return
-        response = self._session.get_all_pages("/api/v1/budgets")
+        all_pages = self._session.get_all_pages("/api/v1/budgets")
 
-        for data in response["data"]:
+        for data in all_pages["data"]:
             self.firefly_data.budgets[data["attributes"]["name"]] = data
 
         for budget in self.data.budgets.values():
@@ -1061,9 +1061,9 @@ class Importer:
             return
 
         for budget, budget_data in self.firefly_data.budgets.items():
-            response = self._session.get_all_pages(f"/api/v1/budgets/{budget_data['id']}/limits")
+            all_pages = self._session.get_all_pages(f"/api/v1/budgets/{budget_data['id']}/limits")
 
-            for data in response["data"]:
+            for data in all_pages["data"]:
                 self.firefly_data.budget_limits[
                     (budget, arrow.get(data["attributes"]["start"]), arrow.get(data["attributes"]["end"]))
                 ] = data
@@ -1098,9 +1098,9 @@ class Importer:
         # check cache
         if self.firefly_data.categories:
             return
-        response = self._session.get_all_pages("/api/v1/categories")
+        all_pages = self._session.get_all_pages("/api/v1/categories")
 
-        for data in response["data"]:
+        for data in all_pages["data"]:
             self.firefly_data.categories[data["attributes"]["name"]] = int(data["id"])
 
         for category in self.data.categories:
@@ -1122,9 +1122,9 @@ class Importer:
         params = {"type": "asset"}
         if date:
             params["date"] = date.format("YYYY-MM-DD")
-        response = self._session.get_all_pages("/api/v1/accounts", params=params)
+        all_pages = self._session.get_all_pages("/api/v1/accounts", params=params)
 
-        for data in response["data"]:
+        for data in all_pages["data"]:
             self.firefly_data.asset_accounts[data["attributes"]["name"]] = data
 
         for account in self.data.asset_accounts:
@@ -1171,9 +1171,9 @@ class Importer:
         if firefly_data:
             return
 
-        response = self._session.get_all_pages(f"/api/v1/accounts?type={account_type}")
+        all_pages = self._session.get_all_pages(f"/api/v1/accounts?type={account_type}")
 
-        for data in response["data"]:
+        for data in all_pages["data"]:
             firefly_data[data["attributes"]["name"]] = data
 
         for account in accounts:

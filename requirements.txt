@@ -1,6 +1,0 @@
-arrow
-dacite
-funcy
-ipdb
-requests[security]
-toml
