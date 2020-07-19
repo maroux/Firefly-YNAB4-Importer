@@ -1,19 +1,19 @@
-YNAB4-Firefly-iii-Export
-========================
+Firefly Importer Importer
+=========================
 
-.. image:: https://img.shields.io/pypi/v/ynab4-firefly-exporter.svg?style=flat-square
-    :target: https://pypi.python.org/pypi/ynab4-firefly-exporter
+.. image:: https://img.shields.io/pypi/v/Firefly-YNAB4-Importer.svg?style=flat-square
+    :target: https://pypi.python.org/pypi/Firefly-YNAB4-Importer
 
-.. image:: https://img.shields.io/pypi/pyversions/ynab4-firefly-exporter.svg?style=flat-square
-    :target: https://pypi.python.org/pypi/ynab4-firefly-exporter
+.. image:: https://img.shields.io/pypi/pyversions/Firefly-YNAB4-Importer.svg?style=flat-square
+    :target: https://pypi.python.org/pypi/Firefly-YNAB4-Importer
 
-.. image:: https://img.shields.io/pypi/implementation/ynab4-firefly-exporter.svg?style=flat-square
-    :target: https://pypi.python.org/pypi/ynab4-firefly-exporter
+.. image:: https://img.shields.io/pypi/implementation/Firefly-YNAB4-Importer.svg?style=flat-square
+    :target: https://pypi.python.org/pypi/Firefly-YNAB4-Importer
 
 .. image:: https://img.shields.io/badge/code%20style-black-000000.svg
     :target: https://github.com/ambv/black
 
-Simple importer for moving from YNAB4_ to `Firefly-iii`_.
+Simple importer for moving from YNAB4_ (You Need A Budget) to `Firefly-iii`_.
 
 What?
 -----
@@ -69,7 +69,7 @@ Pre-requisites:
 
 Setup:
 
-1. Install: ``pip install ynab4-firefly-exporter``
+1. Install: ``pip install Firefly-YNAB4-Importer``
 #. Export YNAB 4 data to local disk
 #. Setup config (see ``config.example.toml`` for documentation)
 #. Backup Firefly iii database! (IMPORTANT!)
@@ -81,7 +81,7 @@ Setup:
 
      export FIREFLY_III_URL=<firefly url>
      export FIREFLY_III_ACCESS_TOKEN=<firefly access token>
-     ynab4-firefly-exporter <config file> "<register path>" "<budget path>"
+     firefly-ynab4-importer <config file> "<register path>" "<budget path>"
 
    where:
 
@@ -100,7 +100,7 @@ Setup:
 
      .. code-block:: sh
 
-       ynab4-firefly-exporter <config file> "<register path>" "<budget path>" "<start month>" "<end month>"
+       Firefly-YNAB4-Importer <config file> "<register path>" "<budget path>" "<start month>" "<end month>"
 
 Development
 -----------
@@ -110,7 +110,7 @@ Setup:
 1. Install python 3.8+ using favorite tool e.g. Pyenv_.
 #. Optionally create virtualenv using your favorite method e.g. `Pyenv virtualenv`_.
 #. Install requirements: ``pip install -e .[dev]``
-#. Verify `ynab4-firefly-exporter` runs cleanly.
+#. Verify `Firefly-YNAB4-Importer` runs cleanly.
 #. Publish new version:
 
    .. code-block:: sh

@@ -19,7 +19,7 @@ import dacite
 import funcy
 import requests
 import toml
-from ynab4_firefly_exporter import VERSION
+from firefly_ynab4_importer import VERSION
 
 YNAB_TRANSACTION_FIELDS = [
     # Which account is this entry for?
@@ -1241,7 +1241,7 @@ class Importer:
                 transactions_data = []
                 for tx in tx_group.transactions:
                     tx_data = {
-                        "original_source": f"YNAB-Firefly-Export-v{VERSION}",
+                        "original_source": f"Firefly-YNAB4-Importer-v{VERSION}",
                         "type": tx.__class__.__name__.lower(),
                         "date": tx.date,
                         "amount": tx.amount,

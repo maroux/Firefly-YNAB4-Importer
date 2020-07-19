@@ -18,7 +18,7 @@ with open(path.join(cwd, "README.rst"), encoding="utf-8") as f:
 
 _version_re = re.compile(r"VERSION\s+=\s+(.*)")
 
-with open("ynab4_firefly_exporter/__init__.py") as f:
+with open("firefly_ynab4_importer/__init__.py") as f:
     version = str(ast.literal_eval(_version_re.search(f.read()).group(1)))
 
 tests_require = [
@@ -33,11 +33,11 @@ tests_require = [
 ]
 
 setup(
-    name="ynab4-firefly-exporter",
+    name="Firefly-YNAB4-Importer",
     version=version,
-    description="YNAB 4 to Firefly iii Exporter",
+    description="Firefly iii Importer from YNAB 4",
     long_description=long_description,
-    url="https://github.com/maroux/YNAB4-Firefly-iii-Exporter",
+    url="https://github.com/maroux/Firefly-YNAB4-Importer",
     author="Aniruddha Maru",
     license="MIT",
     maintainer="Aniruddha Maru",
@@ -53,9 +53,9 @@ setup(
         "License :: OSI Approved :: MIT License",
     ],
     python_requires=">=3.8",
-    keywords="ynab ynab4 firefly fireflyiii ynab-exporter",
+    keywords="ynab ynab4 firefly fireflyiii",
     # https://mypy.readthedocs.io/en/latest/installed_packages.html
-    package_data={"ynab4_firefly_exporter": ["py.typed"]},
+    package_data={"firefly_ynab4_importer": ["py.typed"]},
     packages=find_packages(exclude=["contrib", "docs", "tests", "tests.*"]),
     # List run-time dependencies here.  These will be installed by pip when
     # your project is installed. For an analysis of "install_requires" vs pip's
@@ -69,5 +69,5 @@ setup(
     # $ pip install -e .[dev,test]
     extras_require={"dev": ["flake8", "mypy"], "test": tests_require, "publish": ["wheel", "bumpversion", "twine"]},
     include_package_data=True,
-    entry_points={"console_scripts": ["ynab4-firefly-exporter=ynab4_firefly_exporter.main:main"]},
+    entry_points={"console_scripts": ["firefly-ynab4-importer=firefly_ynab4_importer.main:main"]},
 )
