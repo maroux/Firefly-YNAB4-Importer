@@ -1,0 +1,73 @@
+# The date format set in your YNAB 4 configuration. This is the format in which YNAB will export dates,
+# thus is required if not an ISO 8601 format like YYYY-MM-DD.
+# See https://arrow.readthedocs.io/en/stable/#supported-tokens for format documentation
+# type: str
+date_format = "DD/MM/YYYY"
+
+# Default currency code - see wiki for list: https://en.wikipedia.org/wiki/ISO_4217#Active_codes
+# type: Enum[<codes>]
+# default: USD
+currency = "EUR"
+
+# Table to rename payees
+# type: Map[str, str]
+[payee_mapping]
+"" = "(no name)"
+"Citi" = "Citibank"
+
+# Table to rename budgets. Since budgets in Firefly is a flat list, while YNAB was heirarchical, its possible
+# some budget names need renaming so they can be unique.
+# type: Map[str, str]
+[budget_mapping]
+"Savings Goals:Vacation" = "Vacation Savings"
+"Savings Goals:Furnishings" = "Furnishings Savings"
+
+# Don't import budget limits
+# type: bool
+# default: false
+skip_budget_limits_import = false
+
+# Which YNAB field should map to category in Firefly?
+# type: Enum[Category, Sub Category, Master Category]
+# default: Sub Category
+category_field = "Category"
+
+# Which YNAB field should map to budget in Firefly?
+# type: Enum[Category, Sub Category, Master Category]
+# default: Sub Category
+budget_field = "Category"
+
+# Should memo in YNAB be used as description in Firefly?
+# If set to false, notes field in Firefly will be populated from memo.
+# type: bool
+# default: true
+memo_to_description = false
+
+# What value should be used if a description can't be determined automatically?
+# This is also the value that'll get used if `memo_to_description` is false.
+# type: str
+# default: "(empty description)"
+empty_description = "N/A"
+
+# add as many accounts as you want to customize --
+# double quote if name contains space
+[accounts."<account name>"]
+
+# if foreign currency, use appropriate code here
+# See wiki for list: https://en.wikipedia.org/wiki/ISO_4217#Active_codes
+# type: Enum[<codes>]
+# default: currency specified at top-level config
+currency = "<ISO 4217 currency code>"
+
+# Account role
+# type: Enum[default, credit_card, cash, savings]
+# default: default
+role = "<role>"
+
+# Monthly payment date - required if it can't be inferred from your transactions.
+# type: date (ISO 8601). Only requires date, so 2020-01-18 is valid.
+monthly_payment_date = "<date>"
+
+# Mark an account as invalid after the import is done.
+# type: bool, default: false
+inactive = true
