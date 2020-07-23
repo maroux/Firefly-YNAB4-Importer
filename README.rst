@@ -81,7 +81,7 @@ Setup:
 
      export FIREFLY_III_URL=<firefly url>
      export FIREFLY_III_ACCESS_TOKEN=<firefly access token>
-     firefly-ynab4-importer <config file> "<register path>" "<budget path>"
+     firefly-ynab4-importer import <config file> "<register path>" "<budget path>"
 
    where:
 
