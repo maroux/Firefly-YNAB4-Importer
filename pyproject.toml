@@ -5,12 +5,7 @@ target_version = ['py38']
 [tool.isort]
 default_section = "THIRDPARTY"
 known_first_party = [
-    "importer",
-]
-known_standard_library = [
-    "typing",
-    "setuptools",
-    "pkg_resources",
+    "firefly_ynab4_importer",
 ]
 multi_line_output = 3
 include_trailing_comma = true

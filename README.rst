@@ -100,7 +100,7 @@ Setup:
 
      .. code-block:: sh
 
-       Firefly-YNAB4-Importer <config file> "<register path>" "<budget path>" "<start month>" "<end month>"
+       firefly-ynab4-importer import <config file> "<register path>" "<budget path>" "<start month>" "<end month>"
 
 Development
 -----------
@@ -133,7 +133,6 @@ Contributing
 
 If you find this useful and want to contribute, here's a list of feature I'd like to add -
 
-- Move to click_ + better CLI documentation
 - Investigate budget history support
 - Mark accounts as inactive automatically
 - Multiple foreign currencies (rare, but possible)

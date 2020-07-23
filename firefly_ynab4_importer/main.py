@@ -3,22 +3,25 @@ import csv
 import dataclasses
 import enum
 import json
-import os
 import re
-import sys
 from collections import defaultdict
+from datetime import datetime
 from decimal import Decimal
 from functools import partial
 from io import StringIO
 from itertools import chain
 from pathlib import Path
 from typing import Callable, ClassVar, Dict, Iterator, List, Optional, Set, Tuple, Union
+from urllib.parse import urlparse
 
 import arrow
+import click
 import dacite
 import funcy
 import requests
 import toml
+from colorama import Fore, Style
+
 from firefly_ynab4_importer import VERSION
 
 YNAB_TRANSACTION_FIELDS = [
@@ -595,8 +598,8 @@ class Importer:
         config_path: str,
         register_path: str,
         budget_path: str,
-        filter_min_date: str,
-        filter_max_date: str,
+        filter_min_date: Optional[datetime] = None,
+        filter_max_date: Optional[datetime] = None,
     ):
         firefly_url = firefly_url.rstrip("/")
 
@@ -1314,12 +1317,85 @@ class Importer:
             print(output.getvalue())
 
 
-def main() -> None:
-    firefly_url = os.environ["FIREFLY_III_URL"]
-    firefly_token = os.environ["FIREFLY_III_ACCESS_TOKEN"]
-    importer = Importer(firefly_url, firefly_token, sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-    importer.run()
+@click.group()
+@click.version_option(prog_name="Firefly-YNAB4-Importer", version=VERSION)
+def cli():
+    pass
+
+
+def validate_url_option(ctx, param, value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        raise click.BadParameter(f"{param} must be a valid URL")
+    if parsed.scheme == "http" and parsed.netloc not in ["localhost", "127.0.0.1"]:
+        click.echo(Fore.RED + "WARNING: Using http endpoint for non-localhost is insecure" + Style.RESET_ALL)
+
+
+@cli.command(name="import")
+@click.argument("config-file", type=click.Path(exists=True))
+@click.argument(
+    "register-file", type=click.Path(exists=True),
+)
+@click.argument("budget-file", type=click.Path(exists=True))
+@click.option("--dry-run/--no-dry-run", default=False, help="Process all transactions but don't import anything")
+@click.option(
+    "--firefly-url",
+    envvar="FIREFLY_III_URL",
+    show_envvar=True,
+    prompt=True,
+    callback=validate_url_option,
+    help="Website address of your own Firefly III instance",
+)
+@click.option(
+    "--firefly-access-token",
+    envvar="FIREFLY_III_ACCESS_TOKEN",
+    show_envvar=True,
+    prompt=True,
+    expose_value=False,
+    help="Personal Access Token on your Profile",
+)
+@click.option(
+    "--filter-min-date",
+    type=click.DateTime(formats=["YYYY-MM-DD", "MM-DD-YYYY"]),
+    help="Filter transactions by date and only import transfers on or after this date.",
+)
+@click.option(
+    "--filter-max-date",
+    type=click.DateTime(formats=["YYYY-MM-DD", "MM-DD-YYYY"]),
+    help="Filter transactions by date and only import transfers on or before this date.",
+)
+def import_transactions(
+    config_file: click.Path,
+    register_file: click.Path,
+    budget_file: click.Path,
+    dry_run: bool,
+    firefly_url: str,
+    firefly_access_token: str,
+    filter_min_date: Optional[datetime],
+    filter_max_date: Optional[datetime],
+):
+    """
+    Imports transactions into Firefly\f
+
+    config-file is the path to Config (see config.example.toml for documentation)
+    register-file is the path to the YNAB export register file (the one named ``<budge name> as of
+    <timestamp>-Register.csv``)
+    budget-file is the path to the YNAB export budget file (the one named ``<budge name> as of
+    <timestamp>-Budget.csv``)
+    """
+    click.echo("Importing transactions")
+    importer = Importer(
+        firefly_url,
+        firefly_access_token,
+        click.format_filename(config_file),
+        click.format_filename(register_file),
+        click.format_filename(budget_file),
+        filter_min_date=filter_min_date,
+        filter_max_date=filter_max_date,
+    )
+    importer.run(dry_run)
 
 
 if __name__ == "__main__":
-    main()
+    cli()

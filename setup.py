@@ -61,13 +61,17 @@ setup(
     # your project is installed. For an analysis of "install_requires" vs pip's
     # requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=["arrow", "dacite", "funcy", "ipdb", "requests[security]", "toml"],
+    install_requires=["arrow", "dacite", "funcy", "requests[security]", "toml", "click"],
     tests_require=tests_require,
     # List additional groups of dependencies here (e.g. development
     # dependencies). You can install these using the following syntax,
     # for example:
     # $ pip install -e .[dev,test]
-    extras_require={"dev": ["flake8", "mypy"], "test": tests_require, "publish": ["wheel", "bumpversion", "twine"]},
+    extras_require={
+        "dev": ["flake8", "mypy", "ipdb"],
+        "test": tests_require,
+        "publish": ["wheel", "bumpversion", "twine"],
+    },
     include_package_data=True,
-    entry_points={"console_scripts": ["firefly-ynab4-importer=firefly_ynab4_importer.main:main"]},
+    entry_points={"console_scripts": ["firefly-ynab4-importer=firefly_ynab4_importer.main:cli"]},
 )
