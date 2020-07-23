@@ -133,8 +133,8 @@ Contributing
 
 If you find this useful and want to contribute, here's a list of feature I'd like to add -
 
+- Import Reconciliation transactions correctly
 - Investigate budget history support
-- Mark accounts as inactive automatically
 - Multiple foreign currencies (rare, but possible)
 - Command to clear cache, and move cache to appropriate directory depending on platform (e.g. ``~/.cache`` on Unix)
 - Better error handling - guide user on how to correct problems

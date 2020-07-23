@@ -648,7 +648,8 @@ class Importer:
             self._create_asset_accounts()
             self._create_payee_accounts("revenue")
             self._create_payee_accounts("expense")
-            self._create_transactions()
+            # self._create_transactions()
+            self._post_import()
 
     def _payee(self, tx: YNABTransaction) -> str:
         return self.config.payee_mapping.get(tx.payee.strip(), tx.payee.strip())
@@ -1039,9 +1040,10 @@ class Importer:
             try:
                 if budget.name in self.firefly_data.budgets:
                     if _firefly_needs_update(data, self.firefly_data.budgets[budget.name]):
-                        self._session.put(
+                        response = self._session.put(
                             f"/api/v1/budgets/{self.firefly_data.budgets[budget.name]['id']}", json=data,
                         )
+                        self.firefly_data.budgets[budget.name] = response.json()["data"]
                 else:
                     response = self._session.post("/api/v1/budgets", json=data)
                     self.firefly_data.budgets[budget.name] = response.json()["data"]
@@ -1082,9 +1084,10 @@ class Importer:
             firefly_data = self.firefly_data.budget_limits.get((bg_hist.name, bg_hist.start, bg_hist.end))
             if firefly_data:
                 if _firefly_needs_update(data, firefly_data):
-                    self._session.put(
-                        f"/api/v1/budgets/limits/{firefly_data['id']}", json=data,
-                    )
+                    response = self._session.put(f"/api/v1/budgets/limits/{firefly_data['id']}", json=data,)
+                    self.firefly_data.budget_limits[(bg_hist.name, bg_hist.start, bg_hist.end)] = response.json()[
+                        "data"
+                    ]
             else:
                 response = self._session.post(f"/api/v1/budgets/{data['budget_id']}/limits", json=data)
                 self.firefly_data.budget_limits[(bg_hist.name, bg_hist.start, bg_hist.end)] = response.json()["data"]
@@ -1137,7 +1140,7 @@ class Importer:
                 "type": "asset",
                 "account_role": account.role.value,
                 "currency_id": self.firefly_data.currencies[
-                    self.config.accounts.get(account.name, Config.Account()).currency or self.config.currency
+                    self.config.account(account.name).currency or self.config.currency
                 ],
                 "include_net_worth": True,
             }
@@ -1150,9 +1153,10 @@ class Importer:
 
             if account.name in self.firefly_data.asset_accounts:
                 if _firefly_needs_update(data, self.firefly_data.asset_accounts[account.name]):
-                    self._session.put(
+                    response = self._session.put(
                         f"/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}", json=data,
                     )
+                    self.firefly_data.asset_accounts[account.name] = response.json()["data"]
             else:
                 response = self._session.post("/api/v1/accounts", json=data)
                 self.firefly_data.asset_accounts[account.name] = response.json()["data"]
@@ -1160,6 +1164,41 @@ class Importer:
             self._update_cache()
         if not suppress_print:
             print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
+
+    def _update_inactive_accounts(self) -> None:
+        count = 0
+        for account in self.data.asset_accounts:
+            account_config = self.config.account(account.name)
+            if not account_config.inactive:
+                continue
+
+            count += 1
+            assert (
+                self.firefly_data.asset_accounts[account.name]["attributes"]["current_balance"] == 0
+            ), f"Marking as inactive account |{account.name}| with non-zero balance!?"
+
+            data = {
+                "name": account.name,
+                "active": False,
+                "type": "asset",
+                "account_role": account.role.value,
+                "currency_id": self.firefly_data.currencies[account_config.currency or self.config.currency],
+                "include_net_worth": True,
+            }
+            if account.opening_balance:
+                # firefly iii will not update date unless balance is non-zero
+                data.update({"opening_balance": account.opening_balance, "opening_balance_date": account.opening_date})
+            if account.role is ImportData.Account.Role.credit_card:
+                data["credit_card_type"] = "monthlyFull"
+                data["monthly_payment_date"] = account.monthly_payment_date
+
+            if _firefly_needs_update(data, self.firefly_data.asset_accounts[account.name]):
+                response = self._session.put(
+                    f"/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}", json=data,
+                )
+                self.firefly_data.asset_accounts[account.name] = response.json()["data"]
+        self._update_cache()
+        print(f"Updated {count} inactive asset accounts")
 
     def _create_payee_accounts(self, account_type: str) -> None:
         assert account_type in ("revenue", "expense")
@@ -1316,6 +1355,9 @@ class Importer:
             output.flush()
             print(output.getvalue())
 
+    def _post_import(self) -> None:
+        self._update_inactive_accounts()
+
 
 @click.group()
 @click.version_option(prog_name="Firefly-YNAB4-Importer", version=VERSION)
@@ -1330,6 +1372,7 @@ def validate_url_option(ctx, param, value):
         raise click.BadParameter(f"{param} must be a valid URL")
     if parsed.scheme == "http" and parsed.netloc not in ["localhost", "127.0.0.1"]:
         click.echo(Fore.RED + "WARNING: Using http endpoint for non-localhost is insecure" + Style.RESET_ALL)
+    return value
 
 
 @cli.command(name="import")
@@ -1352,7 +1395,6 @@ def validate_url_option(ctx, param, value):
     envvar="FIREFLY_III_ACCESS_TOKEN",
     show_envvar=True,
     prompt=True,
-    expose_value=False,
     help="Personal Access Token on your Profile",
 )
 @click.option(
@@ -1372,8 +1414,8 @@ def import_transactions(
     dry_run: bool,
     firefly_url: str,
     firefly_access_token: str,
-    filter_min_date: Optional[datetime],
-    filter_max_date: Optional[datetime],
+    filter_min_date: Optional[datetime] = None,
+    filter_max_date: Optional[datetime] = None,
 ):
     """
     Imports transactions into Firefly\f
