@@ -70,6 +70,10 @@ YNAB_BUDGET_FIELDS = [
     "Category Balance",
 ]
 
+# args: currency code, default currency amount, date, memo amount in foreign currency
+# return value: amount in foreign currency
+ForexCalculator = Callable[[str, Decimal, arrow.Arrow, Optional[Decimal]], Decimal]
+
 
 @dataclasses.dataclass(frozen=True)
 class YNABTransaction:
@@ -88,7 +92,7 @@ class YNABTransaction:
     outflow: Decimal
     inflow: Decimal
     cleared: str
-    running_balance: Decimal
+    running_balance: Union[Decimal, Callable[[], Decimal]]
 
     # Interpreted from memo etc
     foreign_amount: Optional[Union[Decimal, Callable[[], Decimal]]] = None
@@ -107,6 +111,10 @@ class YNABTransaction:
     @property
     def is_transfer(self) -> bool:
         return "Transfer : " in self.payee
+
+    @property
+    def is_starting_balance(self) -> bool:
+        return self.payee == "Starting Balance"
 
     @property
     def transfer_account(self) -> str:
@@ -136,9 +144,7 @@ class YNABTransaction:
             tx, account=real_from_account, payee=real_to_account, outflow=self.inflow, inflow=self.outflow,
         )
 
-    def fix_foreign(
-        self, config: "Config", forex_calculator: Callable[[str, Decimal, arrow.Arrow], Decimal]
-    ) -> "YNABTransaction":
+    def fix_foreign(self, config: "Config", forex_calculator: ForexCalculator) -> "YNABTransaction":
         """
         Populates foreign amount and currency code if this is a transaction involving a foreign and a default account
         """
@@ -159,13 +165,33 @@ class YNABTransaction:
             # use memo - yaay!
             amount = Decimal(m.group(2).replace(",", ""))
             # thousand multiplier: 1K => 1,000
-            if m.group(2) == "K":
+            if m.group(3) == "K":
                 amount *= 1000
             memo = (m.group(4) or "").strip()
-            return dataclasses.replace(self, foreign_amount=amount, foreign_currency=foreign_currency_code, memo=memo)
+            _calculator = partial(
+                forex_calculator, foreign_currency_code, self.inflow or self.outflow, self.date, amount
+            )
+            _running_balance_calculator = partial(
+                forex_calculator, foreign_currency_code, self.running_balance, self.date, None
+            )
+            return dataclasses.replace(
+                self,
+                foreign_amount=_calculator,
+                foreign_currency=foreign_currency_code,
+                memo=memo,
+                running_balance=_running_balance_calculator,
+            )
 
-        _calculator = partial(forex_calculator, foreign_currency_code, self.inflow or self.outflow, self.date)
-        return dataclasses.replace(self, foreign_amount=_calculator, foreign_currency=foreign_currency_code)
+        _calculator = partial(forex_calculator, foreign_currency_code, self.inflow or self.outflow, self.date, None)
+        _running_balance_calculator = partial(
+            forex_calculator, foreign_currency_code, self.running_balance, self.date, None
+        )
+        return dataclasses.replace(
+            self,
+            foreign_amount=_calculator,
+            foreign_currency=foreign_currency_code,
+            running_balance=_running_balance_calculator,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -288,7 +314,7 @@ class ImportData:
         opening_date: arrow.Arrow
         monthly_payment_date: Optional[arrow.Arrow] = None
         role: Role = Role.default
-        opening_balance: Decimal = Decimal(0)
+        opening_balance: Union[Decimal, Callable[[], Decimal]] = Decimal(0)
         currency_code: str = "USD"
 
     @dataclasses.dataclass(frozen=True)
@@ -377,10 +403,6 @@ class FireflyData:
     expense_accounts: Dict[str, dict] = dataclasses.field(default_factory=dict)
     # map of foreign currency to map of date to converstion ratio for converting from default currency to this currency
     forex_conversion: Dict[Tuple[str, arrow.Arrow], Decimal] = dataclasses.field(default_factory=dict)
-
-
-def create_transaction():
-    pass
 
 
 AMOUNT_RE = re.compile(r"^(-)?[^0-9]*([0-9,.]+)$")
@@ -654,7 +676,9 @@ class Importer:
     def _payee(self, tx: YNABTransaction) -> str:
         return self.config.payee_mapping.get(tx.payee.strip(), tx.payee.strip())
 
-    def _forex_calculator(self, currency_code: str, amount: Decimal, date: arrow.Arrow) -> Decimal:
+    def _forex_calculator(
+        self, currency_code: str, amount: Decimal, date: arrow.Arrow, memo_amount: Optional[Decimal] = None
+    ) -> Decimal:
         conv_rate = self.firefly_data.forex_conversion.get((currency_code, date))
         if conv_rate is None:
             response = requests.get(
@@ -664,7 +688,38 @@ class Importer:
             conv_rate = Decimal(response.json()["rates"][currency_code])
             self.firefly_data.forex_conversion[(currency_code, date)] = conv_rate
             self._update_cache()
-        return amount * conv_rate
+        foreign_amount = round(amount * conv_rate, 2)
+        if memo_amount and abs(memo_amount - foreign_amount) / memo_amount > 0.20:
+            raise ValueError(f"Forex calculator amount: {foreign_amount} much different from memo: {memo_amount}")
+        return memo_amount or foreign_amount
+
+    def _running_balance(
+        self, tx: YNABTransaction, config: "Config", forex_calculator: ForexCalculator
+    ) -> Union[Decimal, Callable[[], Decimal]]:
+        amount = tx.running_balance
+        if self.config.is_foreign(tx.account):
+            tx_fixed = tx.fix_foreign(config, forex_calculator)
+            amount = tx_fixed.running_balance
+        return amount
+
+    def _starting_balance(
+        self, tx: YNABTransaction, config: "Config", forex_calculator: ForexCalculator
+    ) -> Union[Decimal, Callable[[], Decimal]]:
+        amount = tx.inflow - tx.outflow
+        if self.config.is_foreign(tx.account):
+            tx_fixed = tx.fix_foreign(config, forex_calculator)
+            amount = tx_fixed.foreign_amount
+            if callable(amount):
+
+                def _signer():
+                    if tx.inflow < tx.outflow:
+                        return -1 * amount()
+                    return amount()
+
+                return _signer
+            elif tx.inflow < tx.outflow:
+                amount *= -1
+        return amount
 
     def _amount(self, tx: YNABTransaction) -> Union[Decimal, Callable[[], Decimal]]:
         # exactly one of these would be non-zero
@@ -783,9 +838,9 @@ class Importer:
             assert acc in account_names, f"Unknown account with no transactions in config: |{acc}|"
 
         starting_balances: Dict[str, Tuple[arrow.Arrow, Decimal]] = {
-            tx.account: (tx.date, tx.inflow - tx.outflow)
+            tx.account: (tx.date, self._starting_balance(tx, self.config, self._forex_calculator))
             for tx in self.all_transactions
-            if tx.payee == "Starting Balance"
+            if tx.is_starting_balance
         }
 
         for acc in account_names:
@@ -824,10 +879,18 @@ class Importer:
             self.data.asset_accounts.append(account)
 
         self.data.revenue_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if tx.is_deposit and not tx.is_transfer}
+            {
+                self._payee(tx)
+                for tx in self.all_transactions
+                if tx.is_deposit and not tx.is_transfer and not tx.is_starting_balance
+            }
         )
         self.data.expense_accounts = list(
-            {self._payee(tx) for tx in self.all_transactions if tx.is_expense and not tx.is_transfer}
+            {
+                self._payee(tx)
+                for tx in self.all_transactions
+                if tx.is_expense and not tx.is_transfer and not tx.is_starting_balance
+            }
         )
         print(
             f"Configured account data for {len(self.data.asset_accounts)} asset accounts, "
@@ -839,10 +902,12 @@ class Importer:
         for tx in reversed(self.all_transactions):
             tx_month = tx.date.replace(day=1)
             if tx_month not in self.data.running_balances or tx.account not in self.data.running_balances[tx_month]:
-                self.data.running_balances[tx_month][tx.account] = tx.running_balance
+                self.data.running_balances[tx_month][tx.account] = self._running_balance(
+                    tx, self.config, self._forex_calculator
+                )
 
         transactions = funcy.remove(
-            lambda tx: (tx.inflow == 0 and tx.outflow == 0) or tx.payee == "Starting Balance", self.all_transactions
+            lambda tx: (tx.inflow == 0 and tx.outflow == 0) or tx.is_starting_balance, self.all_transactions
         )
         splits, non_splits = funcy.split(lambda tx: "(Split " in tx.memo, transactions)
         splits_grouped = funcy.group_by(_split_key, splits)
@@ -1118,21 +1183,17 @@ class Importer:
         self._update_cache()
         print(f"Created {len(self.firefly_data.categories)} categories")
 
-    def _create_asset_accounts(
-        self, ignore_cache: bool = False, suppress_print: bool = False, date: Optional[arrow.Arrow] = None
-    ) -> None:
+    def _create_asset_accounts(self) -> None:
         # check cache
-        if not ignore_cache and self.firefly_data.asset_accounts:
+        if self.firefly_data.asset_accounts:
             return
 
-        params = {"type": "asset"}
-        if date:
-            params["date"] = date.format("YYYY-MM-DD")
-        all_pages = self._session.get_all_pages("/api/v1/accounts", params=params)
+        all_pages = self._session.get_all_pages("/api/v1/accounts", params={"type": "asset"})
 
         for data in all_pages["data"]:
             self.firefly_data.asset_accounts[data["attributes"]["name"]] = data
 
+        count = 0
         for account in self.data.asset_accounts:
             data = {
                 "name": account.name,
@@ -1157,13 +1218,12 @@ class Importer:
                         f"/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}", json=data,
                     )
                     self.firefly_data.asset_accounts[account.name] = response.json()["data"]
+                    count += 1
             else:
                 response = self._session.post("/api/v1/accounts", json=data)
                 self.firefly_data.asset_accounts[account.name] = response.json()["data"]
-        if not ignore_cache:
-            self._update_cache()
-        if not suppress_print:
-            print(f"Created {len(self.firefly_data.asset_accounts)} asset accounts")
+                count += 1
+        print(f"Created / updated {count} / {len(self.firefly_data.asset_accounts)} asset accounts")
 
     def _update_inactive_accounts(self) -> None:
         count = 0
@@ -1172,9 +1232,8 @@ class Importer:
             if not account_config.inactive:
                 continue
 
-            count += 1
             assert (
-                self.firefly_data.asset_accounts[account.name]["attributes"]["current_balance"] == 0
+                Decimal(self.firefly_data.asset_accounts[account.name]["attributes"]["current_balance"]) == 0
             ), f"Marking as inactive account |{account.name}| with non-zero balance!?"
 
             data = {
@@ -1197,6 +1256,7 @@ class Importer:
                     f"/api/v1/accounts/{self.firefly_data.asset_accounts[account.name]['id']}", json=data,
                 )
                 self.firefly_data.asset_accounts[account.name] = response.json()["data"]
+                count += 1
         self._update_cache()
         print(f"Updated {count} inactive asset accounts")
 
@@ -1218,6 +1278,7 @@ class Importer:
         for data in all_pages["data"]:
             firefly_data[data["attributes"]["name"]] = data
 
+        count = 0
         for account in accounts:
             data = {
                 "name": account,
@@ -1231,33 +1292,46 @@ class Importer:
                     self._session.put(
                         f"/api/v1/accounts/{firefly_data[account]['id']}", json=data,
                     )
+                    count += 1
             else:
                 response = self._session.post("/api/v1/accounts", json=data)
                 firefly_data[account] = response.json()["data"]["id"]
+                count += 1
         self._update_cache()
-        print(f"Created {len(firefly_data)} {account_type} accounts")
+        print(f"Created / updated {count} / {len(firefly_data)} {account_type} accounts")
 
     def _verify_running_balance(self, month: arrow.Arrow) -> None:
         """
         Before moving to next month verify running balance to match data against YNAB
         """
         # re-fetch asset accounts as of end of month
-        self._create_asset_accounts(ignore_cache=True, suppress_print=True, date=end_of_month(month))
+        all_pages = self._session.get_all_pages(
+            "/api/v1/accounts", params={"type": "asset", "date": end_of_month(month)}
+        )
+        firefly_running_balances: Dict[str, Decimal] = {}
+        for data in all_pages["data"]:
+            firefly_running_balances[data["attributes"]["name"]] = Decimal(str(data["attributes"]["current_balance"]))
 
         for account, balance in self.data.running_balances[month].items():
-            if self.config.is_foreign(account):
-                continue
-            firefly_data = self.firefly_data.asset_accounts[account]["attributes"]
-            # if month < arrow.get(firefly_data["opening_balance_date"]).replace(day=1):
-            #     # if pre-opening date, calculation can't be done correctly. This is a bug in your data!
-            #     continue
-            firefly_balance = firefly_data["current_balance"]
-            if balance != Decimal(str(firefly_balance)):
-                raise ValueError(
-                    f"Running balance for {account} doesn't match for {month.format('MMMM YYYY')}. "
-                    f"YNAB says: {self.config.currency} {balance}, "
-                    f"Firefly says: {self.config.currency} {firefly_balance}"
-                )
+            firefly_balance = firefly_running_balances[account]
+            if callable(balance):
+                balance = balance()
+            match = balance == firefly_balance
+            if not match:
+                if self.config.is_foreign(account):
+                    match = abs(balance - firefly_balance) / balance < 0.05
+                    if not match:
+                        print(
+                            f"[WARN] Match for foreign acount {account} for {month.format('MMMM YYYY')} failed: "
+                            f"YNAB says: {self.config.account(account).currency} {balance}, "
+                            f"Firefly says: {self.config.account(account).currency} {firefly_balance}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Running balance for {account} doesn't match for {month.format('MMMM YYYY')}. "
+                        f"YNAB says: {self.config.account(account).currency} {balance}, "
+                        f"Firefly says: {self.config.account(account).currency} {firefly_balance}"
+                    )
 
     def _create_transactions(self) -> None:
         imported = ignored = 0
