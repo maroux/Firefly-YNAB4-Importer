@@ -806,7 +806,10 @@ class Importer:
             {self._category(bg) for bg in self.all_budgets if self._category(bg) and not bg.is_hidden}
         )
         # Two special categories for income
-        self.data.categories.extend(["Available this month", "Available next month"])
+        if self.config.budget_field == "Category":
+            self.data.categories.extend(["Income:Available this month", "Income:Available next month"])
+        elif self.config.budget_field == "Sub Category":
+            self.data.categories.extend(["Available this month", "Available next month"])
         self.data.budgets.update(
             {
                 budget: ImportData.Budget(name=budget, active=not hidden)
