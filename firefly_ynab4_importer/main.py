@@ -311,7 +311,7 @@ class ImportData:
             cash = "cashWalletAsset"
 
         name: str
-        opening_date: arrow.Arrow
+        opening_date: Optional[arrow.Arrow] = None
         monthly_payment_date: Optional[arrow.Arrow] = None
         role: Role = Role.default
         opening_balance: Union[Decimal, Callable[[], Decimal]] = Decimal(0)
@@ -844,7 +844,7 @@ class Importer:
         }
 
         for acc in account_names:
-            start_date, balance = starting_balances[acc]
+            start_date, balance = starting_balances.get(acc, (None, Decimal(0)))
             account_config = self.config.account(acc)
             role = ImportData.Account.Role[account_config.role.name]
             monthly_payment_date = None

@@ -8,6 +8,7 @@ import ast
 import re
 from codecs import open
 from os import path
+
 from setuptools import find_packages, setup
 
 cwd = path.abspath(path.dirname(__file__))
@@ -61,7 +62,7 @@ setup(
     # your project is installed. For an analysis of "install_requires" vs pip's
     # requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=["arrow", "dacite", "funcy", "requests[security]", "toml", "click"],
+    install_requires=["arrow", "dacite", "funcy", "requests[security]", "toml", "click", "Colorama"],
     tests_require=tests_require,
     # List additional groups of dependencies here (e.g. development
     # dependencies). You can install these using the following syntax,
